@@ -1,0 +1,14 @@
+/target/
+/logs/
+/results/
+/plots/
+/tmp/
+*.out
+*.err
+*.sbatch
+*.slurm
+*.png
+*.pdf
+*.gz
+*.idat
+/data*/
