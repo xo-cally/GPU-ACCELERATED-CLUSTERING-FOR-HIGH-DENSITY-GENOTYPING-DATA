@@ -1,0 +1,24 @@
+[package]
+name = "genotyping_pipeline"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+name = "genotyping_pipeline"
+path = "src/lib.rs"
+
+[dependencies]
+byteorder = "1"
+csv = "1"
+serde = { version = "1", features = ["derive"] }
+chrono = { version = "0.4", features = ["serde"] }
+sha2 = "0.10"
+walkdir = "2"
+flate2 = { version = "1", features = ["rust_backend"] }
+plotters = "0.3"
+rand = "0.8"
+rayon = "1.10"
+
+[[bin]]
+name = "manual_idat_parser"
+path = "src/manual_idat_parser.rs"
