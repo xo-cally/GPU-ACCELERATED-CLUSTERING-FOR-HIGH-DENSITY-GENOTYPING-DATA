@@ -18,7 +18,3 @@ flate2 = { version = "1", features = ["rust_backend"] }
 plotters = "0.3"
 rand = "0.8"
 rayon = "1.10"
-
-[[bin]]
-name = "manual_idat_parser"
-path = "src/manual_idat_parser.rs"
