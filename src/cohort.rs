@@ -3,7 +3,7 @@
 use crate::idat::read_idat_any;
 use crate::model::{
     auto_tau_from_posteriors, bic, fit_diag_restarts, maha2_diag, predict, rmin_from_lnxy_sum,
-    to_features, FeatureSpace, GmmDiag,
+    to_features_from_logs, FeatureSpace, GmmDiag,
 };
 use csv::Writer;
 use rayon::prelude::*;
@@ -11,6 +11,7 @@ use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use plotters::prelude::*;
 
+/// Posterior mode for NoCall threshold
 pub enum PMMode {
     Fixed(f64),
     Auto { alpha: f64 },
@@ -68,6 +69,44 @@ fn common_ids(samples: &[SampleData]) -> Vec<u32> {
     v
 }
 
+// ---- K=1 candidate (for single-cloud SNPs) ----
+fn fit_k1(points: &[(f64, f64)]) -> GmmDiag {
+    let n = points.len().max(1);
+    let (mut mx, mut my) = (0.0, 0.0);
+    for &(x, y) in points {
+        mx += x;
+        my += y;
+    }
+    mx /= n as f64;
+    my /= n as f64;
+
+    let (mut vx, mut vy) = (0.0, 0.0);
+    for &(x, y) in points {
+        vx += (x - mx) * (x - mx);
+        vy += (y - my) * (y - my);
+    }
+    vx = (vx / n as f64).max(1e-2);
+    vy = (vy / n as f64).max(1e-2);
+
+    // log-likelihood under single diagonal Gaussian
+    let mut ll = 0.0;
+    for &(x, y) in points {
+        let dx = x - mx;
+        let dy = y - my;
+        ll += -0.5 * (dx * dx / vx + dy * dy / vy)
+            - 0.5 * ((vx * vy).ln() + 2.0 * std::f64::consts::PI.ln());
+    }
+
+    GmmDiag {
+        k: 1,
+        weights: vec![1.0],
+        means: vec![(mx, my)],
+        vars: vec![(vx, vy)],
+        loglik: ll,
+    }
+}
+
+/// Compare K = 1, 2, 3 via BIC (capped by kmax)
 fn choose_k(
     points: &[(f64, f64)],
     kmax: usize,
@@ -76,15 +115,48 @@ fn choose_k(
     seed: u64,
     restarts: usize,
 ) -> GmmDiag {
-    let g2 = fit_diag_restarts(points, 2, max_it, tol, seed, restarts);
-    if kmax < 3 {
-        return g2;
+    let g1 = fit_k1(points);
+    if kmax <= 1 {
+        return g1;
     }
+    let g2 = fit_diag_restarts(points, 2, max_it, tol, seed, restarts);
+    if kmax == 2 {
+        let (b1, b2) = (bic(&g1, points.len()), bic(&g2, points.len()));
+        return if b1 <= b2 { g1 } else { g2 };
+    }
+    // kmax >= 3
     let g3 = fit_diag_restarts(points, 3, max_it, tol, seed, restarts);
-    if bic(&g3, points.len()) < bic(&g2, points.len()) {
-        g3
-    } else {
+    let (b1, b2, b3) = (bic(&g1, points.len()), bic(&g2, points.len()), bic(&g3, points.len()));
+    if b1 <= b2 && b1 <= b3 {
+        g1
+    } else if b2 <= b3 {
         g2
+    } else {
+        g3
+    }
+}
+
+/// When K=1, call genotype from BOTH axes via a θ-like projection.
+fn single_cloud_call(feature_space: &FeatureSpace, mu: (f64, f64)) -> &'static str {
+    let theta = match *feature_space {
+        FeatureSpace::ThetaR { w_theta, .. } => {
+            let w = w_theta.max(1e-6);
+            (mu.0 / w).clamp(0.0, 1.0)
+        }
+        FeatureSpace::XYLog1p => {
+            // invert (approx): x≈ln(1+R), y≈ln(1+G) -> R,G≈exp()-1
+            let r = mu.0.exp() - 1.0;
+            let g = mu.1.exp() - 1.0;
+            let t = g.atan2(r) / std::f64::consts::PI;
+            if t.is_finite() { t.clamp(0.0, 1.0) } else { 0.5 }
+        }
+    };
+    if theta <= 0.33 {
+        "BB"
+    } else if theta >= 0.67 {
+        "AA"
+    } else {
+        "AB"
     }
 }
 
@@ -98,7 +170,7 @@ pub struct CohortCfg {
     pub tol: f64,
     pub seed: u64,
     pub restarts: usize,
-    // NEW: how many SNPs to plot from the beginning (0 = none)
+    // how many SNPs to plot from the beginning (0 = none)
     pub plot_first_snps: usize,
 }
 
@@ -113,18 +185,16 @@ pub fn run_from_pairs(
         std::fs::create_dir_all(&plots_dir).map_err(|e| e.to_string())?;
     }
 
-    let samples = load_samples(pairs)?;
-    let s = samples.len();
+    let samples = load_samples(pairs)?; let s = samples.len();
     if s < 2 {
         return Err("need >=2 samples".into());
     }
-
     let ids = common_ids(&samples);
     if ids.is_empty() {
         return Err("no common SNPs".into());
     }
 
-    // Precompute ln1p(Red/Green) for r_min auto
+    // Precompute ln1p(Red/Green) for r_min auto (and reuse for features)
     let mut ln_x: Vec<Vec<f64>> = Vec::with_capacity(s);
     let mut ln_y: Vec<Vec<f64>> = Vec::with_capacity(s);
     for sd in &samples {
@@ -146,7 +216,7 @@ pub fn run_from_pairs(
         cfg.r_min
     };
 
-    // Prepare writers (ONLY calls & QC csvs as requested)
+    // Prepare writers (ONLY calls & QC csvs)
     let calls_path = out_dir.join("cohort_calls.csv");
     let qc_path = out_dir.join("cohort_qc_summary.csv");
     let mut w = Writer::from_path(&calls_path).map_err(|e| e.to_string())?;
@@ -154,7 +224,7 @@ pub fn run_from_pairs(
     header.extend(samples.iter().map(|s| s.name.clone()));
     w.write_record(&header).map_err(|e| e.to_string())?;
 
-    // stats per sample – avoid Clone requirement
+    // stats per sample (no Clone bound)
     #[derive(Default)]
     struct PS {
         total: u64,
@@ -176,26 +246,17 @@ pub fn run_from_pairs(
         _ => 0.005,
     };
 
-    // Helper: build a human-readable label for axes/title
+    // Nice label for plots
     let feature_label = match cfg.feature_space {
         FeatureSpace::XYLog1p => "ln(R) vs ln(G)",
         FeatureSpace::ThetaR { w_theta, w_r } => {
-            // Keep the weights visible in title
-            // θ scaled by wθ; r scaled by w_r
-            // Returned string used for both the title and axes splitter.
-            // Format: "θ·wθ=1.00 vs r·w_r=0.45"
-            // (axis labels derived from this by splitting on " vs ").
-            // Keep a short concise representation.
-            // Note: Unicode middle dot is fine in plotters text.
-            // If you prefer ASCII, replace with "*" in both spots.
             Box::leak(format!("θ·wθ={:.2} vs r·w_r={:.2}", w_theta, w_r).into_boxed_str())
         }
     };
 
-    // stream blocks
+    // streaming blocks
     let m = ids.len();
     let block = 10_000.min(m).max(1);
-    // global counter for how many plots have been written
     let mut plots_emitted: usize = 0;
 
     for chunk_start in (0..m).step_by(block) {
@@ -208,10 +269,6 @@ pub fn run_from_pairs(
             labs: Vec<usize>,
             post: Vec<f64>,
             means: Vec<(f64, f64)>,
-            // vars kept for distance gates (already applied), not needed for CSV
-            vars: Vec<(f64, f64)>,
-            // index in the global SNP order, for plot capping
-            global_i: usize,
         }
 
         let rows: Vec<Row> = (chunk_start..end)
@@ -222,12 +279,19 @@ pub fn run_from_pairs(
                 let mut raw = Vec::with_capacity(s);
                 for si in 0..s {
                     let p = *samples[si].pos.get(&id).unwrap();
-                    let red = samples[si].x_red[p];
-                    let grn = samples[si].y_grn[p];
-                    pts.push(to_features(&cfg.feature_space, red, grn));
-                    raw.push(red as u32 + grn as u32);
+                    // Reuse cached logs for features (faster for both XY and ThetaR)
+                    let lnr = ln_x[si][p];
+                    let lng = ln_y[si][p];
+                    pts.push(to_features_from_logs(&cfg.feature_space, lnr, lng));
+
+                    // Raw intensity sum still from originals
+                    let red = samples[si].x_red[p] as u32;
+                    let grn = samples[si].y_grn[p] as u32;
+                    raw.push(red + grn);
                 }
+
                 let model = choose_k(&pts, cfg.k_max, cfg.max_iters, cfg.tol, cfg.seed, cfg.restarts);
+
                 let (mut labs, mut post) = (Vec::new(), Vec::new());
                 predict(&model, &pts, &mut labs, &mut post);
 
@@ -239,14 +303,13 @@ pub fn run_from_pairs(
                         post[si] = 0.0; // force NoCall downstream
                     }
                 }
+
                 Row {
                     id,
                     raw,
                     labs,
                     post,
                     means: model.means.clone(),
-                    vars: model.vars.clone(),
-                    global_i: j,
                 }
             })
             .collect();
@@ -270,21 +333,34 @@ pub fn run_from_pairs(
             let mut out = Vec::with_capacity(1 + s);
             out.push(r.id.to_string());
 
-            // genotype name mapping by increasing mean.x (theta for ThetaR, lnR for XY)
-            let mut idx: Vec<(usize, f64)> = r.means.iter().enumerate().map(|(i, m)| (i, m.0)).collect();
-            idx.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap());
-            let mut names = vec![""; r.means.len()];
-            match r.means.len() {
+            // Map cluster index -> genotype name
+            let names: Vec<&'static str> = match r.means.len() {
+                1 => {
+                    let call = single_cloud_call(&cfg.feature_space, r.means[0]);
+                    vec![call]
+                }
                 2 => {
-                    names[idx[0].0] = "BB";
-                    names[idx[1].0] = "AA";
+                    // left=BB, right=AA (by mean.x)
+                    let mut idx: Vec<(usize, f64)> =
+                        r.means.iter().enumerate().map(|(i, m)| (i, m.0)).collect();
+                    idx.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap());
+                    let mut n = vec![""; 2];
+                    n[idx[0].0] = "BB";
+                    n[idx[1].0] = "AA";
+                    n
                 }
                 _ => {
-                    names[idx[0].0] = "BB";
-                    names[idx[1].0] = "AB";
-                    names[idx[2].0] = "AA";
+                    // left=BB, mid=AB, right=AA
+                    let mut idx: Vec<(usize, f64)> =
+                        r.means.iter().enumerate().map(|(i, m)| (i, m.0)).collect();
+                    idx.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap());
+                    let mut n = vec![""; r.means.len()];
+                    n[idx[0].0] = "BB";
+                    n[idx[1].0] = "AB";
+                    n[idx[2].0] = "AA";
+                    n
                 }
-            }
+            };
 
             // Write calls & update stats
             for si in 0..s {
@@ -296,9 +372,11 @@ pub fn run_from_pairs(
                     continue;
                 }
                 st.pass_raw += 1;
+
                 if r.post[si] >= 0.90 {
                     st.calls_p090 += 1;
                 }
+
                 if r.post[si] < tau {
                     st.nocall_p += 1;
                     out.push("NoCall".into());
@@ -310,16 +388,15 @@ pub fn run_from_pairs(
             }
             w.write_record(out).map_err(|e| e.to_string())?;
 
-            // ---- Plot only the first N SNPs globally ----
+            // Plots: first N SNPs only
             if cfg.plot_first_snps > 0 && plots_emitted < cfg.plot_first_snps {
-                // rebuild feature points for plotting & color by names[]
-                // We reuse the order above (by si)
+                // Rebuild feature points from cached logs (fast) for plotting
                 let mut pts = Vec::with_capacity(s);
                 for si in 0..s {
                     let p = *samples[si].pos.get(&r.id).unwrap();
-                    let red = samples[si].x_red[p];
-                    let grn = samples[si].y_grn[p];
-                    pts.push(to_features(&cfg.feature_space, red, grn));
+                    let lnr = ln_x[si][p];
+                    let lng = ln_y[si][p];
+                    pts.push(to_features_from_logs(&cfg.feature_space, lnr, lng));
                 }
 
                 let plot_path_base = plots_dir.join(format!("snp_{:08}", r.id));
@@ -392,7 +469,7 @@ fn write_cluster_scatter_png(
     // Build the output path and an owned string for plotters
     let file = out_path_base.with_extension("png");
     let file_to_return = file.clone();
-    let outfile_str: String = file.to_string_lossy().into_owned(); // owned string: no borrow of `file`
+    let outfile_str: String = file.to_string_lossy().into_owned();
 
     // Axis bounds (include centers)
     let mut xmin = f64::INFINITY;
@@ -456,7 +533,7 @@ fn write_cluster_scatter_png(
         _ => BLACK,
     };
 
-    // Helper to draw points + legend
+    // Draw points + legend entries
     let mut draw_group = |group_pts: &[(f64, f64)], gname: &str| -> Result<(), String> {
         if group_pts.is_empty() {
             return Ok(());
