@@ -11,4 +11,6 @@
 *.pdf
 *.gz
 *.idat
+*.txt
+*.csv
 /data*/
