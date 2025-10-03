@@ -1,3 +1,5 @@
+//model.rs
+
 use rand::{rngs::StdRng, Rng, SeedableRng};
 use std::cmp::Ordering;
 
