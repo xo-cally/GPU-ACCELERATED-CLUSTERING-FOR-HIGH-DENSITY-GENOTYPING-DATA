@@ -1,5 +1,3 @@
-//pairs.rs
-
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use walkdir::WalkDir;

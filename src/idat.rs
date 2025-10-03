@@ -1,5 +1,3 @@
-//idat.rs
-
 use byteorder::{LittleEndian, ReadBytesExt};
 use flate2::read::GzDecoder;
 use std::fs::File;
@@ -9,7 +7,7 @@ use std::path::Path;
 #[derive(Debug, Clone, Copy)]
 pub struct DirEntry { pub code: u16, pub offset: u64 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct IdatData {
     pub version: u32,
     pub nfields: u32,
@@ -44,9 +42,9 @@ pub fn read_idat_from_reader<R: Read + Seek>(mut reader: R) -> Result<IdatData, 
     let mut magic = [0u8; 4];
     reader.read_exact(&mut magic).map_err(|e| e.to_string())?;
     if &magic != b"IDAT" { return Err("bad magic".into()); }
-    // Illumina IDAT v3 directory-style header:
-    // u64 version (expect 3), u32 nfields, then nfields x (u16 code, u64 offset)
-    let version = read_u64(&mut reader)? as u32; // == 3
+
+    // Illumina IDAT v3 directory header
+    let version = read_u64(&mut reader)? as u32;
     if version != 3 { return Err(format!("unsupported version {}", version)); }
     let nfields = read_u32(&mut reader)?;
     if nfields == 0 || nfields > 50_000 { return Err(format!("unreasonable nfields {}", nfields)); }

@@ -1,5 +1,3 @@
-//main.rs
-
 use chrono::Local;
 use std::path::PathBuf;
 
@@ -8,7 +6,7 @@ use genotyping_pipeline::model::FeatureSpace;
 use genotyping_pipeline::cohort::{run_from_pairs, CohortCfg, PMMode};
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
-    // Defaults
+    // Defaults (you can wire your richer CLI back in if you want the whole optimizer/feedback stack on top)
     let mut root = PathBuf::from("/dataC/idat");
     let mut out_dir = PathBuf::from(format!("results/{}", Local::now().format("%Y%m%d_%H%M")));
 
@@ -25,7 +23,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut plot_first_snps: usize = 0;  // default: no plots
     let mut first_pairs: Option<usize> = None; // cap number of sample pairs processed
 
-    // --- CLI ---
+    // --- CLI (light) ---
     let mut args = std::env::args().skip(1);
     while let Some(a) = args.next() {
         match a.as_str() {
@@ -74,9 +72,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         println!("No IDAT pairs found under {}", root.display());
         return Ok(());
     }
-    if let Some(n) = first_pairs {
-        if pairs.len() > n { pairs.truncate(n); }
-    }
+    if let Some(n) = first_pairs { if pairs.len() > n { pairs.truncate(n); } }
     println!("Found {} pairs under {}", pairs.len(), root.display());
 
     let cfg = CohortCfg {
