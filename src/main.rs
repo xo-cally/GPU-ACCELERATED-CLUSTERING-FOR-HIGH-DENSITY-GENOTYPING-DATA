@@ -4,27 +4,31 @@ use std::path::PathBuf;
 use genotyping_pipeline::pairs::find_pairs_sorted;
 use genotyping_pipeline::model::FeatureSpace;
 use genotyping_pipeline::cohort::{run_from_pairs, CohortCfg, PMMode};
-use genotyping_pipeline::preflight::compute_rmin_like_pipeline;
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
-    // Defaults (light CLI)
+    // Defaults
     let mut root = PathBuf::from("/dataC/idat");
     let mut out_dir = PathBuf::from(format!("results/{}", Local::now().format("%Y%m%d_%H%M")));
 
     // feature + gates defaults
     let mut feat = FeatureSpace::XYLog1p;
-    let mut r_min: u32 = 0;                 // 0 => auto (we'll compute & pin it below)
-    let mut p_mode: PMMode = PMMode::Fixed(0.90);
+    let mut r_min: u32 = 0;                 // 0 => auto (per-sample 1D-GMM median)
+    let mut p_mode: PMMode = PMMode::Auto { alpha: 0.005 };
     let mut alpha = 0.005f64;               // when p_mode=Auto
     let mut max_maha = 6.0f64;              // radius gate (sqrt of chi^2_2)
 
     let (mut k_max, mut max_iters, mut tol, mut seed, mut restarts) =
         (3usize, 200usize, 1e-6f64, 42u64, 3usize);
 
-    let mut plot_first_snps: usize = 0;  // default: no plots
+    let mut plot_first_snps: usize = 20;  // default: plot first N SNPs
     let mut first_pairs: Option<usize> = None; // cap number of sample pairs processed
 
-    // --- CLI (light) ---
+    // NEW: normalization toggles / inputs
+    let mut norm_affine = false;
+    let mut norm_illumina = false;
+    let mut bead_pools_csv: Option<PathBuf> = None;
+
+    // --- CLI ---
     let mut args = std::env::args().skip(1);
     while let Some(a) = args.next() {
         match a.as_str() {
@@ -63,8 +67,20 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             "--restarts"  => restarts  = args.next().unwrap().parse().unwrap(),
             "--first"     => first_pairs = args.next().and_then(|v| v.parse().ok()),
             "--plot-first-snps" => plot_first_snps = args.next().unwrap().parse().unwrap(),
+
+            // NEW: normalization flags
+            "--norm-affine" => { norm_affine = true; }
+            "--norm-illumina" => { norm_illumina = true; }
+            "--bead-pools" => {
+                bead_pools_csv = Some(PathBuf::from(args.next().unwrap()));
+            }
+
             _ => {}
         }
+    }
+
+    if norm_affine && norm_illumina {
+        eprintln!("WARN: --norm-affine and --norm-illumina both set; Illumina transform will be used.");
     }
 
     std::fs::create_dir_all(&out_dir)?;
@@ -73,46 +89,29 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         println!("No IDAT pairs found under {}", root.display());
         return Ok(());
     }
-    if let Some(n) = first_pairs {
-        if pairs.len() > n { pairs.truncate(n); }
-    }
+    if let Some(n) = first_pairs { if pairs.len() > n { pairs.truncate(n); } }
     println!("Found {} pairs under {}", pairs.len(), root.display());
+    println!("Plots: first {} SNPs will be rendered into {}/plots/", plot_first_snps, out_dir.display());
+    println!("Normalization: norm_affine={} norm_illumina={} bead_pools_csv={:?}",
+        norm_affine, norm_illumina, bead_pools_csv);
 
-    // --- NEW: compute & pin r_min like the pipeline would, if requested ---
-    if r_min == 0 {
-        match compute_rmin_like_pipeline(&root, first_pairs) {
-            Ok(auto_rmin) => {
-                println!("Auto r_min (pipeline-style) = {}", auto_rmin);
-                r_min = auto_rmin; // pin it so the run is explicit/reproducible
-            }
-            Err(e) => {
-                eprintln!("WARN: auto r_min computation failed ({e}); falling back to internal auto (r_min=0).");
-                // keep r_min = 0 to let run_from_pairs do its internal auto path
-            }
-        }
-    }
+    let cfg = CohortCfg {
+        feature_space: feat,
+        r_min,
+        p_mode,
+        max_maha,
+        k_max,
+        max_iters,
+        tol,
+        seed,
+        restarts,
+        plot_first_snps,
 
-let cfg = CohortCfg {
-    feature_space: feat,
-    r_min,
-    p_mode,
-    max_maha,
-    k_max,
-    max_iters,
-    tol,
-    seed,
-    restarts,
-    plot_first_snps,
-
-    // NEW (adjust paths or make them CLI flags later)
-    feedback_in: Some(PathBuf::from("feedback.csv")),
-    feedback_out: Some(PathBuf::from("feedback.csv")),
-    bad_snps_in: Some(PathBuf::from("bad_snps.txt")),
-    bad_snps_out: Some(PathBuf::from("bad_snps.txt")),
-    nocall_bad_thresh: 0.35,
-    drop_bad_snps: true,
-};
-
+        // NEW
+        norm_affine,
+        norm_illumina,
+        bead_pools_csv,
+    };
 
     let (calls, qc) = run_from_pairs(&pairs, &out_dir, cfg)
         .map_err(|e| format!("cohort error: {e}"))?;

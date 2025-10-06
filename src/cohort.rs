@@ -8,14 +8,32 @@ use rayon::prelude::*;
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use plotters::prelude::*;
-use crate::adaptive::{Feedback,FbEntry,load_feedback,save_feedback,load_bad_snps,save_bad_snps};
 
-/// Posterior mode for NoCall threshold
+// =============== PMMode / Config ===============
 pub enum PMMode {
     Fixed(f64),
     Auto { alpha: f64 },
 }
 
+pub struct CohortCfg {
+    pub feature_space: FeatureSpace,
+    pub r_min: u32, // 0 => auto
+    pub p_mode: PMMode,
+    pub max_maha: f64,
+    pub k_max: usize,
+    pub max_iters: usize,
+    pub tol: f64,
+    pub seed: u64,
+    pub restarts: usize,
+    pub plot_first_snps: usize,
+
+    // NEW: normalization toggles + bead pools
+    pub norm_affine: bool,              // old whitening path
+    pub norm_illumina: bool,            // new Illumina-style per-pool transform
+    pub bead_pools_csv: Option<PathBuf> // CSV: IlluminaID,pool_id (u32,u16)
+}
+
+// =============== Sample cache ===============
 #[derive(Clone)]
 struct SampleData {
     name: String,
@@ -31,9 +49,13 @@ fn load_samples(pairs: &[(PathBuf, PathBuf)]) -> Result<Vec<SampleData>, String>
         let g = read_idat_any(gpath).map_err(|e| format!("{}: {}", gpath.display(), e))?;
         let r = read_idat_any(rpath).map_err(|e| format!("{}: {}", rpath.display(), e))?;
         let n = g.means.len().min(r.means.len());
-        if n == 0 { return Err("empty pair".into()); }
+        if n == 0 {
+            return Err("empty pair".into());
+        }
         let mut pos = HashMap::with_capacity(n);
-        for (i, &id) in g.illumina_ids.iter().take(n).enumerate() { pos.insert(id, i); }
+        for (i, &id) in g.illumina_ids.iter().take(n).enumerate() {
+            pos.insert(id, i);
+        }
         let stem = gpath.file_stem().and_then(|s| s.to_str()).unwrap_or("sample");
         let name = stem.strip_suffix("_Grn").unwrap_or(stem).to_string();
         out.push(SampleData {
@@ -59,11 +81,249 @@ fn common_ids(samples: &[SampleData]) -> Vec<u32> {
     v
 }
 
-// ---- K=1 candidate (single-cloud SNPs) ----
+// =============== Normalization support ===============
+
+// ---- bead pools CSV ----
+fn load_bead_pools_csv(path: &Path) -> Result<HashMap<u32, u16>, String> {
+    let mut out = HashMap::new();
+    let mut rdr = csv::ReaderBuilder::new()
+        .has_headers(true)
+        .flexible(true)
+        .from_path(path)
+        .map_err(|e| e.to_string())?;
+    for rec in rdr.records().flatten() {
+        let id: u32 = rec.get(0).unwrap_or("").trim().parse().map_err(|_| "bad illumina_id")?;
+        let pool: u16 = rec.get(1).unwrap_or("0").trim().parse().unwrap_or(0);
+        out.insert(id, pool);
+    }
+    Ok(out)
+}
+
+// ---- your existing whitening (keep it) ----
+#[derive(Clone, Copy, Debug)]
+struct PoolAffine { mx:f64, my:f64, w11:f64, w12:f64, w21:f64, w22:f64 }
+
+fn apply_affine(pa: Option<&PoolAffine>, x: f64, y: f64) -> (f64, f64) {
+    if let Some(p) = pa {
+        let cx = x - p.mx;
+        let cy = y - p.my;
+        (p.w11 * cx + p.w12 * cy, p.w21 * cx + p.w22 * cy)
+    } else { (x, y) }
+}
+
+// helper for 2x2 symmetric eigendecomp
+fn eig2_sym(a: f64, b: f64, c: f64) -> ((f64,f64,f64),(f64,f64,f64)) {
+    let tr = a + c;
+    let det = a*c - b*b;
+    let disc = (tr*tr - 4.0*det).max(0.0).sqrt();
+    let l1 = 0.5*(tr + disc);
+    let l2 = 0.5*(tr - disc);
+    let (v1x, v1y) = if b.abs() > 1e-12 { (l1 - c, b) } else { (1.0, 0.0) };
+    let n1 = (v1x*v1x + v1y*v1y).sqrt().max(1e-18);
+    let v1x = v1x / n1; let v1y = v1y / n1;
+    let v2x = -v1y; let v2y = v1x;
+    ((l1, v1x, v1y), (l2, v2x, v2y))
+}
+
+fn compute_pool_affines(
+    samples: &[SampleData],
+    ids: &[u32],
+    bead_pools: &HashMap<u32, u16>,
+) -> HashMap<u16, PoolAffine> {
+    #[derive(Default)]
+    struct Acc { n:f64, sx:f64, sy:f64, sxx:f64, syy:f64, sxy:f64 }
+    let mut acc: HashMap<u16, Acc> = HashMap::new();
+
+    for &id in ids {
+        let pool = bead_pools.get(&id).copied().unwrap_or(0u16);
+        let a = acc.entry(pool).or_default();
+        for sd in samples {
+            if let Some(&p) = sd.pos.get(&id) {
+                let x = sd.x_red[p] as f64;
+                let y = sd.y_grn[p] as f64;
+                a.n += 1.0;
+                a.sx += x; a.sy += y;
+                a.sxx += x*x; a.syy += y*y; a.sxy += x*y;
+            }
+        }
+    }
+
+    let mut out = HashMap::new();
+    for (pool, a) in acc {
+        if a.n < 10.0 {
+            out.insert(pool, PoolAffine { mx:0.0, my:0.0, w11:1.0, w12:0.0, w21:0.0, w22:1.0 });
+            continue;
+        }
+        let mx = a.sx / a.n;
+        let my = a.sy / a.n;
+        let cxx = (a.sxx/a.n) - mx*mx;
+        let cyy = (a.syy/a.n) - my*my;
+        let cxy = (a.sxy/a.n) - mx*my;
+
+        let ((l1, v1x, v1y), (l2, v2x, v2y)) = eig2_sym(cxx, cxy, cyy);
+        let eps = 1e-9;
+        let s1 = 1.0 / (l1.max(eps)).sqrt();
+        let s2 = 1.0 / (l2.max(eps)).sqrt();
+
+        let w11 = s1*v1x*v1x + s2*v2x*v2x;
+        let w12 = s1*v1x*v1y + s2*v2x*v2y;
+        let w21 = w12;
+        let w22 = s1*v1y*v1y + s2*v2y*v2y;
+
+        out.insert(pool, PoolAffine { mx, my, w11, w12, w21, w22 });
+    }
+    out
+}
+
+// ---- NEW: Illumina-style translate→rotate→shear→scale ----
+#[derive(Clone, Copy, Debug)]
+struct IlluminaAffine {
+    ox: f64, oy: f64,
+    cos_t: f64, sin_t: f64,
+    shx: f64,
+    sx: f64, sy: f64,
+}
+
+#[inline]
+fn apply_illumina_affine(a: Option<&IlluminaAffine>, x: f64, y: f64) -> (f64, f64) {
+    if let Some(t) = a {
+        // translate
+        let cx = x - t.ox;
+        let cy = y - t.oy;
+        // rotate
+        let rx =  t.cos_t * cx + t.sin_t * cy;
+        let ry = -t.sin_t * cx + t.cos_t * cy;
+        // shear X|Y
+        let sx = rx - t.shx * ry;
+        let sy = ry;
+        // scale
+        (sx * t.sx, sy * t.sy)
+    } else { (x, y) }
+}
+
+fn percentile(v: &mut [f64], p: f64) -> f64 {
+    if v.is_empty() { return 0.0; }
+    let p = p.clamp(0.0, 1.0);
+    let k = ((v.len() as f64 - 1.0) * p).round() as usize;
+    v.sort_by(|a,b| a.partial_cmp(b).unwrap());
+    v[k]
+}
+
+fn trim_bounds(xs: &[f64], lo: f64, hi: f64) -> (f64, f64) {
+    let mut v = xs.to_vec();
+    let a = percentile(&mut v, lo);
+    let b = percentile(&mut v, hi);
+    (a, b)
+}
+
+fn robust_center_cov(xs: &[f64], ys: &[f64]) -> (f64,f64, f64,f64,f64) {
+    assert_eq!(xs.len(), ys.len());
+    let n = xs.len();
+    if n == 0 { return (0.0,0.0, 1.0,1.0, 0.0); }
+
+    // 2%–98% trimming on each axis
+    let (xl, xh) = trim_bounds(xs, 0.02, 0.98);
+    let (yl, yh) = trim_bounds(ys, 0.02, 0.98);
+
+    let mut cx = 0.0; let mut cy = 0.0; let mut cnt = 0.0;
+    for i in 0..n {
+        let (x, y) = (xs[i], ys[i]);
+        if x < xl || x > xh || y < yl || y > yh { continue; }
+        cx += x; cy += y; cnt += 1.0;
+    }
+    if cnt < 5.0 { return (0.0,0.0, 1.0,1.0, 0.0); }
+    cx /= cnt; cy /= cnt;
+
+    let mut sxx=0.0; let mut syy=0.0; let mut sxy=0.0; let mut m=0.0;
+    for i in 0..n {
+        let (x, y) = (xs[i], ys[i]);
+        if x < xl || x > xh || y < yl || y > yh { continue; }
+        let dx = x - cx; let dy = y - cy;
+        sxx += dx*dx; syy += dy*dy; sxy += dx*dy; m += 1.0;
+    }
+    if m < 5.0 { return (cx, cy, 1.0, 1.0, 0.0); }
+    (cx, cy, sxx.max(1e-9)/m, syy.max(1e-9)/m, sxy/m)
+}
+
+fn compute_pool_affines_illumina(
+    samples: &[SampleData],
+    ids: &[u32],
+    bead_pools: &HashMap<u32, u16>,
+) -> HashMap<u16, IlluminaAffine> {
+    let mut xs_by_pool: HashMap<u16, Vec<f64>> = HashMap::new();
+    let mut ys_by_pool: HashMap<u16, Vec<f64>> = HashMap::new();
+
+    for &id in ids {
+        let pool = bead_pools.get(&id).copied().unwrap_or(0u16);
+        let xs = xs_by_pool.entry(pool).or_default();
+        let ys = ys_by_pool.entry(pool).or_default();
+        for s in samples {
+            if let Some(&p) = s.pos.get(&id) {
+                xs.push(s.x_red[p] as f64);
+                ys.push(s.y_grn[p] as f64);
+            }
+        }
+    }
+
+    let mut out: HashMap<u16, IlluminaAffine> = HashMap::new();
+
+    for (pool, xs) in xs_by_pool.into_iter() {
+        let ys = ys_by_pool.get(&pool).cloned().unwrap_or_default();
+        if xs.len() < 50 || ys.len() < 50 {
+            out.insert(pool, IlluminaAffine { ox:0.0, oy:0.0, cos_t:1.0, sin_t:0.0, shx:0.0, sx:1.0, sy:1.0 });
+            continue;
+        }
+
+        let (cx, cy, vxx, vyy, vxy) = robust_center_cov(&xs, &ys);
+        // principal axis rotation
+        let theta = 0.5 * (2.0 * vxy).atan2(vxx - vyy);
+        let cos_t = theta.cos();
+        let sin_t = theta.sin();
+
+        // rotate all points around robust center to estimate shear/scale
+        let mut rx: Vec<f64> = Vec::with_capacity(xs.len());
+        let mut ry: Vec<f64> = Vec::with_capacity(xs.len());
+        for i in 0..xs.len() {
+            let dx = xs[i] - cx; let dy = ys[i] - cy;
+            rx.push( cos_t*dx + sin_t*dy );
+            ry.push(-sin_t*dx + cos_t*dy );
+        }
+
+        // shear to remove residual covariance: shx ≈ cov(rx,ry)/var(ry)
+        let (_mx, my, _vx2, vy2, vxy2) = robust_center_cov(&rx, &ry);
+        let shx = if vy2 > 1e-12 { vxy2 / vy2 } else { 0.0 };
+
+        // estimate scales on sheared coords
+        let mut sxv=0.0; let mut syv=0.0; let mut cnt=0.0;
+        for i in 0..rx.len() {
+            let sx_ = rx[i] - shx * ry[i];
+            let sy_ = ry[i] - my; // zero-mean on Y after rotation
+            sxv += sx_*sx_; syv += sy_*sy_; cnt += 1.0;
+        }
+        let (vx_, vy_) = if cnt > 1.0 { (sxv/cnt, syv/cnt) } else { (1.0, 1.0) };
+        let sx = 1.0 / vx_.max(1e-9).sqrt();
+        let sy = 1.0 / vy_.max(1e-9).sqrt();
+
+        out.insert(pool, IlluminaAffine { ox:cx, oy:cy, cos_t, sin_t, shx, sx, sy });
+    }
+
+    out
+}
+
+#[derive(Clone, Copy)]
+enum NormMode {
+    None,
+    AffinePool,
+    IlluminaPool,
+}
+
+// =============== K=1 baseline & choose_k (unchanged) ===============
 fn fit_k1(points: &[(f64, f64)]) -> GmmDiag {
     let n = points.len().max(1);
     let (mut mx, mut my) = (0.0, 0.0);
-    for &(x, y) in points { mx += x; my += y; }
+    for &(x, y) in points {
+        mx += x; my += y;
+    }
     mx /= n as f64; my /= n as f64;
 
     let (mut vx, mut vy) = (0.0, 0.0);
@@ -74,18 +334,17 @@ fn fit_k1(points: &[(f64, f64)]) -> GmmDiag {
     vx = (vx / n as f64).max(1e-2);
     vy = (vy / n as f64).max(1e-2);
 
-    // log-likelihood under single diagonal Gaussian
     let mut ll = 0.0;
     for &(x, y) in points {
-        let dx = x - mx; let dy = y - my;
+        let dx = x - mx;
+        let dy = y - my;
         ll += -0.5 * (dx * dx / vx + dy * dy / vy)
             - 0.5 * ((vx * vy).ln() + 2.0 * std::f64::consts::PI.ln());
     }
 
-    GmmDiag { k:1, weights: vec![1.0], means: vec![(mx,my)], vars: vec![(vx,vy)], loglik: ll }
+    GmmDiag { k: 1, weights: vec![1.0], means: vec![(mx, my)], vars: vec![(vx, vy)], loglik: ll }
 }
 
-/// Compare K = 1, 2, 3 via BIC (capped by kmax)
 fn choose_k(
     points: &[(f64, f64)],
     kmax: usize,
@@ -106,7 +365,7 @@ fn choose_k(
     if b1 <= b2 && b1 <= b3 { g1 } else if b2 <= b3 { g2 } else { g3 }
 }
 
-/// When K=1, call genotype from BOTH axes via a θ-like projection.
+// =============== Single-cloud call helper (unchanged) ===============
 fn single_cloud_call(feature_space: &FeatureSpace, mu: (f64, f64)) -> &'static str {
     let theta = match *feature_space {
         FeatureSpace::ThetaR { w_theta, .. } => {
@@ -123,32 +382,11 @@ fn single_cloud_call(feature_space: &FeatureSpace, mu: (f64, f64)) -> &'static s
     if theta <= 0.33 { "BB" } else if theta >= 0.67 { "AA" } else { "AB" }
 }
 
-pub struct CohortCfg {
-    pub feature_space: FeatureSpace,
-    pub r_min: u32, // 0 => auto (per-sample 1D-GMM median)
-    pub p_mode: PMMode,
-    pub max_maha: f64,
-    pub k_max: usize,
-    pub max_iters: usize,
-    pub tol: f64,
-    pub seed: u64,
-    pub restarts: usize,
-    // how many SNPs to plot from the beginning (0 = none)
-    pub plot_first_snps: usize,
-
-    // NEW: feedback/bad-SNP handling
-    pub feedback_in: Option<PathBuf>,
-    pub feedback_out: Option<PathBuf>,
-    pub bad_snps_in: Option<PathBuf>,
-    pub bad_snps_out: Option<PathBuf>,
-    pub nocall_bad_thresh: f64, // e.g., 0.35
-    pub drop_bad_snps: bool,    // true => skip “bad” rows in outputs/stats
-}
-
+// =============== Main cohort runner (with normalization) ===============
 pub fn run_from_pairs(
     pairs: &[(PathBuf, PathBuf)],
     out_dir: &Path,
-    mut cfg: CohortCfg,
+    cfg: CohortCfg,
 ) -> Result<(PathBuf, PathBuf), String> {
     std::fs::create_dir_all(out_dir).map_err(|e| e.to_string())?;
     let plots_dir = out_dir.join("plots");
@@ -157,15 +395,11 @@ pub fn run_from_pairs(
     }
 
     let samples = load_samples(pairs)?; let s = samples.len();
-    if s < 2 {
-        return Err("need >=2 samples".into());
-    }
+    if s < 2 { return Err("need >=2 samples".into()); }
     let ids = common_ids(&samples);
-    if ids.is_empty() {
-        return Err("no common SNPs".into());
-    }
+    if ids.is_empty() { return Err("no common SNPs".into()); }
 
-    // Precompute ln1p(Red/Green) for r_min auto (and reuse for features)
+    // Precompute ln1p(Red/Green) for features/r_min
     let mut ln_x: Vec<Vec<f64>> = Vec::with_capacity(s);
     let mut ln_y: Vec<Vec<f64>> = Vec::with_capacity(s);
     for sd in &samples {
@@ -173,7 +407,35 @@ pub fn run_from_pairs(
         ln_y.push(sd.y_grn.iter().map(|&v| (v as f64 + 1.0).ln()).collect());
     }
 
-    // r_min (auto per-sample via 1D GMM, then median)
+    // --- Normalization setup (bead pools + mode + transforms) ---
+    let bead_pools: HashMap<u32, u16> = if let Some(ref p) = cfg.bead_pools_csv {
+        match load_bead_pools_csv(p) {
+            Ok(m) => { eprintln!("NORMALIZATION: bead pools entries = {}", m.len()); m }
+            Err(e) => { eprintln!("WARN: bead pools CSV unreadable: {} (using pool 0)", e); HashMap::new() }
+        }
+    } else { HashMap::new() };
+
+    let norm_mode = if cfg.norm_illumina {
+        if cfg.norm_affine {
+            eprintln!("WARN: norm_illumina + norm_affine both set; using Illumina transform");
+        }
+        NormMode::IlluminaPool
+    } else if cfg.norm_affine {
+        NormMode::AffinePool
+    } else {
+        NormMode::None
+    };
+
+    let pool_affines = match norm_mode {
+        NormMode::AffinePool => Some(compute_pool_affines(&samples, &ids, &bead_pools)),
+        _ => None
+    };
+    let pool_illumina = match norm_mode {
+        NormMode::IlluminaPool => Some(compute_pool_affines_illumina(&samples, &ids, &bead_pools)),
+        _ => None
+    };
+
+    // r_min
     let r_min = if cfg.r_min == 0 {
         let mut per_sample = Vec::with_capacity(s);
         for si in 0..s {
@@ -187,7 +449,7 @@ pub fn run_from_pairs(
         cfg.r_min
     };
 
-    // Prepare writers (ONLY calls & QC csvs)
+    // Prepare writers (calls & QC)
     let calls_path = out_dir.join("cohort_calls.csv");
     let qc_path = out_dir.join("cohort_qc_summary.csv");
     let mut w = Writer::from_path(&calls_path).map_err(|e| e.to_string())?;
@@ -195,7 +457,7 @@ pub fn run_from_pairs(
     header.extend(samples.iter().map(|s| s.name.clone()));
     w.write_record(&header).map_err(|e| e.to_string())?;
 
-    // stats per sample (no Clone bound)
+    // stats per sample
     #[derive(Default)]
     struct PS {
         total: u64,
@@ -204,9 +466,6 @@ pub fn run_from_pairs(
         nocall_p: u64,
         calls_tau: u64,
         calls_p090: u64,
-        calls_aa_tau: u64,
-        calls_ab_tau: u64,
-        calls_bb_tau: u64,
     }
     let mut stats: Vec<PS> = (0..s).map(|_| PS::default()).collect();
 
@@ -228,18 +487,6 @@ pub fn run_from_pairs(
         }
     };
 
-    // NEW: feedback & bad SNP lists
-    let mut feedback: Feedback = match &cfg.feedback_in {
-        Some(p) => { eprintln!("FEEDBACK: loading {}", p.display()); load_feedback(p) }
-        None => HashMap::new(),
-    };
-    let mut bad_snps_set: HashSet<u32> = match &cfg.bad_snps_in {
-        Some(p) => { let s = load_bad_snps(p); eprintln!("ADAPTIVE: loaded {} bad SNPs", s.len()); s }
-        None => HashSet::new(),
-    };
-    for (snp, fbe) in &feedback { if fbe.bad { bad_snps_set.insert(*snp); } }
-
-    // streaming blocks
     let m = ids.len();
     let block = 10_000.min(m).max(1);
     let mut plots_emitted: usize = 0;
@@ -254,7 +501,6 @@ pub fn run_from_pairs(
             labs: Vec<usize>,
             post: Vec<f64>,
             means: Vec<(f64, f64)>,
-            names: Vec<&'static str>,
         }
 
         let rows: Vec<Row> = (chunk_start..end)
@@ -265,13 +511,30 @@ pub fn run_from_pairs(
                 let mut raw = Vec::with_capacity(s);
                 for si in 0..s {
                     let p = *samples[si].pos.get(&id).unwrap();
-                    let lnr = ln_x[si][p];
-                    let lng = ln_y[si][p];
+                    // normalization on raw ints
+                    let red = samples[si].x_red[p] as f64;
+                    let grn = samples[si].y_grn[p] as f64;
+                    let pool_id = bead_pools.get(&id).copied().unwrap_or(0u16);
+                    let (nx, ny) = match norm_mode {
+                        NormMode::None => (red, grn),
+                        NormMode::AffinePool => {
+                            let a = pool_affines.as_ref().unwrap().get(&pool_id);
+                            apply_affine(a, red, grn)
+                        }
+                        NormMode::IlluminaPool => {
+                            let a = pool_illumina.as_ref().unwrap().get(&pool_id);
+                            apply_illumina_affine(a, red, grn)
+                        }
+                    };
+
+                    // features from normalized ints via logs
+                    let lnr = (nx + 1.0).ln();
+                    let lng = (ny + 1.0).ln();
                     pts.push(to_features_from_logs(&cfg.feature_space, lnr, lng));
 
-                    let red = samples[si].x_red[p] as u32;
-                    let grn = samples[si].y_grn[p] as u32;
-                    raw.push(red + grn);
+                    // Raw intensity sum still from originals (for r_min gate)
+                    let rsum = (samples[si].x_red[p] as u32) + (samples[si].y_grn[p] as u32);
+                    raw.push(rsum);
                 }
 
                 let model = choose_k(&pts, cfg.k_max, cfg.max_iters, cfg.tol, cfg.seed, cfg.restarts);
@@ -284,52 +547,19 @@ pub fn run_from_pairs(
                     let jlab = labs[si];
                     let m2 = maha2_diag(pts[si], model.means[jlab], model.vars[jlab]);
                     if m2.sqrt() > cfg.max_maha {
-                        post[si] = 0.0;
+                        post[si] = 0.0; // force NoCall downstream
                     }
                 }
 
-                // Map cluster index -> genotype name
-                let names: Vec<&'static str> = match model.means.len() {
-                    1 => {
-                        let call = single_cloud_call(&cfg.feature_space, model.means[0]);
-                        vec![call]
-                    }
-                    2 => {
-                        let mut idx: Vec<(usize, f64)> =
-                            model.means.iter().enumerate().map(|(i, m)| (i, m.0)).collect();
-                        idx.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap());
-                        let mut n = vec![""; 2];
-                        n[idx[0].0] = "BB";
-                        n[idx[1].0] = "AA";
-                        n
-                    }
-                    _ => {
-                        let mut idx: Vec<(usize, f64)> =
-                            model.means.iter().enumerate().map(|(i, m)| (i, m.0)).collect();
-                        idx.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap());
-                        let mut n = vec![""; model.means.len()];
-                        n[idx[0].0] = "BB";
-                        n[idx[1].0] = "AB";
-                        n[idx[2].0] = "AA";
-                        n
-                    }
-                };
-
-                Row { id, raw, labs, post, means: model.means.clone(), names }
+                Row { id, raw, labs, post, means: model.means.clone() }
             })
             .collect();
 
-        // Learn τ on first chunk if not fixed; exclude “bad” SNPs from τ pool
         if tau_opt.is_none() {
             let mut ps = Vec::new();
             for r in &rows {
-                if bad_snps_set.contains(&r.id) || feedback.get(&r.id).map(|f| f.bad).unwrap_or(false) {
-                    continue;
-                }
                 for (si, &p) in r.post.iter().enumerate() {
-                    if r.raw[si] >= r_min {
-                        ps.push(p);
-                    }
+                    if r.raw[si] >= r_min { ps.push(p); }
                 }
             }
             let tau = auto_tau_from_posteriors(ps, alpha_default);
@@ -339,82 +569,81 @@ pub fn run_from_pairs(
         let tau = tau_opt.unwrap();
 
         for r in rows {
-            // final bad decision (feedback/list based)
-            let bad_now = bad_snps_set.contains(&r.id) || feedback.get(&r.id).map(|f| f.bad).unwrap_or(false);
-
-            // Update feedback “seen” for this SNP
-            let fbe = feedback.entry(r.id).or_insert(FbEntry::default());
-            fbe.seen += s as u64;
-
-            if cfg.drop_bad_snps && bad_now {
-                // still accumulate feedback on NoCalls (as “fully NoCall”)
-                fbe.nocall_raw += r.raw.iter().filter(|&&rv| rv < r_min).count() as u64;
-                // consider all as NoCall at τ (conservative learning)
-                fbe.nocall_p += s as u64;
-                // hard-mark bad to persist
-                fbe.bad = true;
-                bad_snps_set.insert(r.id);
-                continue;
-            }
-
             let mut out = Vec::with_capacity(1 + s);
             out.push(r.id.to_string());
 
-            let mut nocall_p_cnt_for_this_row = 0u64;
+            // Map cluster index -> genotype name
+            let names: Vec<&'static str> = match r.means.len() {
+                1 => {
+                    let call = single_cloud_call(&cfg.feature_space, r.means[0]);
+                    vec![call]
+                }
+                2 => {
+                    let mut idx: Vec<(usize, f64)> =
+                        r.means.iter().enumerate().map(|(i, m)| (i, m.0)).collect();
+                    idx.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap());
+                    let mut n = vec![""; 2];
+                    n[idx[0].0] = "BB"; n[idx[1].0] = "AA";
+                    n
+                }
+                _ => {
+                    let mut idx: Vec<(usize, f64)> =
+                        r.means.iter().enumerate().map(|(i, m)| (i, m.0)).collect();
+                    idx.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap());
+                    let mut n = vec![""; r.means.len()];
+                    n[idx[0].0] = "BB"; n[idx[1].0] = "AB"; n[idx[2].0] = "AA";
+                    n
+                }
+            };
 
+            // Write calls & update stats
             for si in 0..s {
                 let st = &mut stats[si];
                 st.total += 1;
                 if r.raw[si] < r_min {
                     st.nocall_raw += 1;
-                    st.nocall_p += 1;
                     out.push("NoCall".into());
                     continue;
                 }
                 st.pass_raw += 1;
 
-                if r.post[si] >= 0.90 {
-                    st.calls_p090 += 1;
-                }
+                if r.post[si] >= 0.90 { st.calls_p090 += 1; }
 
                 if r.post[si] < tau {
                     st.nocall_p += 1;
-                    nocall_p_cnt_for_this_row += 1;
                     out.push("NoCall".into());
                 } else {
                     st.calls_tau += 1;
                     let jlab = r.labs[si];
-                    let call = r.names[jlab];
-                    match call {
-                        "AA" => st.calls_aa_tau += 1,
-                        "AB" => st.calls_ab_tau += 1,
-                        "BB" => st.calls_bb_tau += 1,
-                        _ => {}
-                    }
-                    out.push(call.into());
+                    out.push(names[jlab].into());
                 }
             }
+            w.write_record(out).map_err(|e| e.to_string())?;
 
-            // update feedback counts from this row
-            fbe.nocall_raw += r.raw.iter().filter(|&&rv| rv < r_min).count() as u64;
-            fbe.nocall_p += nocall_p_cnt_for_this_row;
-
-            // mark bad if sustained high NoCall rate
-            let rate_p = if fbe.seen > 0 { (fbe.nocall_p as f64) / (fbe.seen as f64) } else { 0.0 };
-            if rate_p >= cfg.nocall_bad_thresh {
-                fbe.bad = true;
-                bad_snps_set.insert(r.id);
-            }
-
-            // Plots: first N kept SNPs only
+            // Plots: first N SNPs only
             if cfg.plot_first_snps > 0 && plots_emitted < cfg.plot_first_snps {
                 let mut pts = Vec::with_capacity(s);
                 for si in 0..s {
                     let p = *samples[si].pos.get(&r.id).unwrap();
-                    let lnr = ln_x[si][p];
-                    let lng = ln_y[si][p];
+                    let red = samples[si].x_red[p] as f64;
+                    let grn = samples[si].y_grn[p] as f64;
+                    let pool_id = bead_pools.get(&r.id).copied().unwrap_or(0u16);
+                    let (nx, ny) = match norm_mode {
+                        NormMode::None => (red, grn),
+                        NormMode::AffinePool => {
+                            let a = pool_affines.as_ref().unwrap().get(&pool_id);
+                            apply_affine(a, red, grn)
+                        }
+                        NormMode::IlluminaPool => {
+                            let a = pool_illumina.as_ref().unwrap().get(&pool_id);
+                            apply_illumina_affine(a, red, grn)
+                        }
+                    };
+                    let lnr = (nx + 1.0).ln();
+                    let lng = (ny + 1.0).ln();
                     pts.push(to_features_from_logs(&cfg.feature_space, lnr, lng));
                 }
+
                 let plot_path_base = plots_dir.join(format!("snp_{:08}", r.id));
                 let _ = write_cluster_scatter_png(
                     &plot_path_base,
@@ -423,12 +652,10 @@ pub fn run_from_pairs(
                     &pts,
                     &r.labs,
                     &r.means,
-                    &r.names,
+                    &["AA","AB","BB"], // legend labels are overwritten by series anyway
                 );
                 plots_emitted += 1;
             }
-
-            w.write_record(out).map_err(|e| e.to_string())?;
         }
         w.flush().map_err(|e| e.to_string())?;
     }
@@ -436,22 +663,9 @@ pub fn run_from_pairs(
     // QC summary
     let mut qcw = Writer::from_path(&qc_path).map_err(|e| e.to_string())?;
     qcw.write_record(&[
-        "Sample",
-        "total_snps",
-        "pass_raw",
-        "nocall_raw",
-        "nocall_p_at_tau",
-        "calls_at_tau",
-        "calls_at_p090",
-        "call_rate_tau",
-        "call_rate_p090",
-        "calls_AA_tau",
-        "calls_AB_tau",
-        "calls_BB_tau",
-        "r_min_used",
-        "tau_used",
-    ])
-    .map_err(|e| e.to_string())?;
+        "Sample","total_snps","pass_raw","nocall_raw","nocall_p_at_tau","calls_at_tau",
+        "calls_at_p090","call_rate_tau","call_rate_p090","r_min_used","tau_used",
+    ]).map_err(|e| e.to_string())?;
     let tau_report = tau_opt.unwrap_or(0.90);
     for (i, st) in stats.iter().enumerate() {
         let name = &samples[i].name;
@@ -467,119 +681,81 @@ pub fn run_from_pairs(
             st.calls_p090.to_string(),
             format!("{:.6}", rate_tau),
             format!("{:.6}", rate_p),
-            st.calls_aa_tau.to_string(),
-            st.calls_ab_tau.to_string(),
-            st.calls_bb_tau.to_string(),
             r_min.to_string(),
             format!("{:.4}", tau_report),
-        ])
-        .map_err(|e| e.to_string())?;
+        ]).map_err(|e| e.to_string())?;
     }
     qcw.flush().map_err(|e| e.to_string())?;
-
-    // Persist adaptive state
-    if let Some(p) = &cfg.bad_snps_out {
-        if let Err(e) = save_bad_snps(p, &bad_snps_set) {
-            eprintln!("WARN: saving bad SNPs failed: {}", e);
-        } else {
-            eprintln!("ADAPTIVE: bad SNP list saved -> {}", p.display());
-        }
-    }
-    if let Some(p) = &cfg.feedback_out {
-        if let Err(e) = save_feedback(p, &feedback) {
-            eprintln!("WARN: saving feedback failed: {}", e);
-        } else {
-            eprintln!("FEEDBACK_OK -> {}", p.display());
-        }
-    }
 
     Ok((calls_path, qc_path))
 }
 
-
-// ---------- Plotting ----------
+// ---------- Plotting (unchanged) ----------
 fn write_cluster_scatter_png(
     out_path_base: &Path,
     snp_id: u32,
-    feature_label: &str, // "ln(R) vs ln(G)" or "θ·wθ=.. vs r·w_r=.."
+    feature_label: &str, // e.g., "ln(R) vs ln(G)" or "θ·wθ=1.00 vs r·w_r=0.45"
     pts: &[(f64, f64)],
     labels: &[usize],
     means: &[(f64, f64)],
-    names: &[&'static str],
+    _names: &[&'static str],
 ) -> Result<PathBuf, String> {
     let file = out_path_base.with_extension("png");
     let file_to_return = file.clone();
     let outfile_str: String = file.to_string_lossy().into_owned();
 
     // Axis bounds (include centers)
-    let mut xmin = f64::INFINITY; let mut xmax = f64::NEG_INFINITY;
-    let mut ymin = f64::INFINITY; let mut ymax = f64::NEG_INFINITY;
+    let mut xmin = f64::INFINITY;
+    let mut xmax = -f64::INFINITY;
+    let mut ymin = f64::INFINITY;
+    let mut ymax = -f64::INFINITY;
     for &(x, y) in pts.iter().chain(means.iter()) {
-        xmin = xmin.min(x); xmax = xmax.max(x);
-        ymin = ymin.min(y); ymax = ymax.max(y);
+        xmin = xmin.min(x);
+        xmax = xmax.max(x);
+        ymin = ymin.min(y);
+        ymax = ymax.max(y);
     }
-    if !xmin.is_finite() || !xmax.is_finite() || !ymin.is_finite() || !ymax.is_finite() {
-        xmin = -1.0; xmax = 1.0; ymin = -1.0; ymax = 1.0;
-    }
-    if (xmax - xmin).abs() < 1e-9 { xmax = xmin + 1.0; }
-    if (ymax - ymin).abs() < 1e-9 { ymax = ymin + 1.0; }
-
-    let padx = (xmax - xmin) * 0.06;
-    let pady = (ymax - ymin) * 0.06;
+    let padx = (xmax - xmin).abs().max(1.0) * 0.06;
+    let pady = (ymax - ymin).abs().max(1.0) * 0.06;
 
     // Split the axis labels from the feature label
     let mut parts = feature_label.split(" vs ");
     let xlab = parts.next().unwrap_or("x");
     let ylab = parts.next().unwrap_or("y");
 
-    // Group points for color/legend by genotype name
-    let mut aa = Vec::new(); let mut ab = Vec::new(); let mut bb = Vec::new();
-    for (i, &(x, y)) in pts.iter().enumerate() {
-        match names[labels[i]] {
-            "AA" => aa.push((x, y)),
-            "AB" => ab.push((x, y)),
-            "BB" => bb.push((x, y)),
-            _ => {}
-        }
-    }
-
     let root = BitMapBackend::new(&outfile_str, (1000, 740)).into_drawing_area();
     root.fill(&WHITE).map_err(|e| e.to_string())?;
 
     let mut chart = ChartBuilder::on(&root)
-        .caption(format!("SNP {} — {}", snp_id, feature_label), ("sans-serif", 26).into_font())
-        .margin(20).x_label_area_size(45).y_label_area_size(55)
+        .caption(
+            format!("SNP {} — {}", snp_id, feature_label),
+            ("sans-serif", 26).into_font(),
+        )
+        .margin(20)
+        .x_label_area_size(45)
+        .y_label_area_size(55)
         .build_cartesian_2d((xmin - padx)..(xmax + padx), (ymin - pady)..(ymax + pady))
         .map_err(|e| e.to_string())?;
 
-    chart.configure_mesh().x_desc(xlab).y_desc(ylab).label_style(("sans-serif", 14)).draw()
+    chart
+        .configure_mesh()
+        .x_desc(xlab)
+        .y_desc(ylab)
+        .label_style(("sans-serif", 14))
+        .draw()
         .map_err(|e| e.to_string())?;
 
-    // Color map: BB = red, AB = blue, AA = green
-    let color_for = |name: &str| match name { "BB" => RED, "AB" => BLUE, "AA" => GREEN, _ => BLACK };
-
-    let mut draw_group = |group_pts: &[(f64, f64)], gname: &str| -> Result<(), String> {
-        if group_pts.is_empty() { return Ok(()); }
-        let c = color_for(gname);
-        chart.draw_series(group_pts.iter().map(|&(x, y)| Circle::new((x, y), 3, c.filled())))
-            .map_err(|e| e.to_string())?
-            .label(match gname {
-                "AA" => "AA (homozygous green)",
-                "AB" => "AB (heterozygous)",
-                "BB" => "BB (homozygous red)",
-                _ => gname,
-            })
-            .legend(move |(x, y)| Circle::new((x, y), 6, c.filled()));
-        Ok(())
-    };
-
-    draw_group(&aa, "AA")?; draw_group(&ab, "AB")?; draw_group(&bb, "BB")?;
-
-    chart.draw_series(means.iter().map(|&(x, y)| Cross::new((x, y), 7, &BLACK)))
+    // Draw points by label color
+    let palette = [&RED, &BLUE, &GREEN, &MAGENTA, &CYAN, &BLACK];
+    chart
+        .draw_series(pts.iter().zip(labels.iter()).map(|(&(x, y), &lab)| {
+            let c = palette[lab % palette.len()];
+            Circle::new((x, y), 3, c.filled())
+        }))
         .map_err(|e| e.to_string())?;
 
-    chart.configure_series_labels().border_style(&BLACK).background_style(WHITE.mix(0.85))
-        .position(SeriesLabelPosition::UpperRight).label_font(("sans-serif", 16)).draw()
+    chart
+        .draw_series(means.iter().map(|&(x, y)| Cross::new((x, y), 7, &BLACK)))
         .map_err(|e| e.to_string())?;
 
     root.present().map_err(|e| e.to_string())?;
