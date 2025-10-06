@@ -17,7 +17,7 @@ pub enum PMMode {
 
 pub struct CohortCfg {
     pub feature_space: FeatureSpace,
-    pub r_min: u32, // 0 => auto
+    pub r_min: u32, // 0 => auto median of per-sample 1D-GMM thresholds on ln(R+G+1)
     pub p_mode: PMMode,
     pub max_maha: f64,
     pub k_max: usize,
@@ -27,9 +27,9 @@ pub struct CohortCfg {
     pub restarts: usize,
     pub plot_first_snps: usize,
 
-    // NEW: normalization toggles + bead pools
-    pub norm_affine: bool,              // old whitening path
-    pub norm_illumina: bool,            // new Illumina-style per-pool transform
+    // Normalization toggles + bead pools
+    pub norm_affine: bool,              // whitening path
+    pub norm_illumina: bool,            // Illumina-style per-pool transform
     pub bead_pools_csv: Option<PathBuf> // CSV: IlluminaID,pool_id (u32,u16)
 }
 
@@ -99,7 +99,7 @@ fn load_bead_pools_csv(path: &Path) -> Result<HashMap<u32, u16>, String> {
     Ok(out)
 }
 
-// ---- your existing whitening (keep it) ----
+// ---- existing whitening (kept) ----
 #[derive(Clone, Copy, Debug)]
 struct PoolAffine { mx:f64, my:f64, w11:f64, w12:f64, w21:f64, w22:f64 }
 
@@ -175,7 +175,7 @@ fn compute_pool_affines(
     out
 }
 
-// ---- NEW: Illumina-style translate→rotate→shear→scale ----
+// ---- Illumina-style translate→rotate→shear→scale ----
 #[derive(Clone, Copy, Debug)]
 struct IlluminaAffine {
     ox: f64, oy: f64,
@@ -231,7 +231,7 @@ fn robust_center_cov(xs: &[f64], ys: &[f64]) -> (f64,f64, f64,f64,f64) {
         if x < xl || x > xh || y < yl || y > yh { continue; }
         cx += x; cy += y; cnt += 1.0;
     }
-    if cnt < 5.0 { return (0.0,0.0, 1.0,1.0, 0.0); }
+    if cnt < 5.0 { return (0.0,0.0, 1.0, 1.0, 0.0); }
     cx /= cnt; cy /= cnt;
 
     let mut sxx=0.0; let mut syy=0.0; let mut sxy=0.0; let mut m=0.0;
@@ -280,7 +280,7 @@ fn compute_pool_affines_illumina(
         let cos_t = theta.cos();
         let sin_t = theta.sin();
 
-        // rotate all points around robust center to estimate shear/scale
+        // rotate points around robust center to estimate shear/scale
         let mut rx: Vec<f64> = Vec::with_capacity(xs.len());
         let mut ry: Vec<f64> = Vec::with_capacity(xs.len());
         for i in 0..xs.len() {
@@ -317,7 +317,7 @@ enum NormMode {
     IlluminaPool,
 }
 
-// =============== K=1 baseline & choose_k (unchanged) ===============
+// =============== K=1 baseline & choose_k ===============
 fn fit_k1(points: &[(f64, f64)]) -> GmmDiag {
     let n = points.len().max(1);
     let (mut mx, mut my) = (0.0, 0.0);
@@ -365,7 +365,7 @@ fn choose_k(
     if b1 <= b2 && b1 <= b3 { g1 } else if b2 <= b3 { g2 } else { g3 }
 }
 
-// =============== Single-cloud call helper (unchanged) ===============
+// =============== Single-cloud call helper ===============
 fn single_cloud_call(feature_space: &FeatureSpace, mu: (f64, f64)) -> &'static str {
     let theta = match *feature_space {
         FeatureSpace::ThetaR { w_theta, .. } => {
@@ -435,7 +435,7 @@ pub fn run_from_pairs(
         _ => None
     };
 
-    // r_min
+    // r_min (0 => auto)
     let r_min = if cfg.r_min == 0 {
         let mut per_sample = Vec::with_capacity(s);
         for si in 0..s {
@@ -572,7 +572,7 @@ pub fn run_from_pairs(
             let mut out = Vec::with_capacity(1 + s);
             out.push(r.id.to_string());
 
-            // Map cluster index -> genotype name
+            // Map cluster index -> genotype name (order by x-mean)
             let names: Vec<&'static str> = match r.means.len() {
                 1 => {
                     let call = single_cloud_call(&cfg.feature_space, r.means[0]);
@@ -644,6 +644,9 @@ pub fn run_from_pairs(
                     pts.push(to_features_from_logs(&cfg.feature_space, lnr, lng));
                 }
 
+                // Build per-cluster genotype names for legend coloring
+                let names_plot: Vec<&'static str> = names.clone();
+
                 let plot_path_base = plots_dir.join(format!("snp_{:08}", r.id));
                 let _ = write_cluster_scatter_png(
                     &plot_path_base,
@@ -652,7 +655,7 @@ pub fn run_from_pairs(
                     &pts,
                     &r.labs,
                     &r.means,
-                    &["AA","AB","BB"], // legend labels are overwritten by series anyway
+                    &names_plot,
                 );
                 plots_emitted += 1;
             }
@@ -690,7 +693,7 @@ pub fn run_from_pairs(
     Ok((calls_path, qc_path))
 }
 
-// ---------- Plotting (unchanged) ----------
+// ---------- Plotting (AA=red, AB=blue, BB=green, legend top-right) ----------
 fn write_cluster_scatter_png(
     out_path_base: &Path,
     snp_id: u32,
@@ -698,7 +701,7 @@ fn write_cluster_scatter_png(
     pts: &[(f64, f64)],
     labels: &[usize],
     means: &[(f64, f64)],
-    _names: &[&'static str],
+    names: &[&'static str],       // cluster index -> "AA"/"AB"/"BB"
 ) -> Result<PathBuf, String> {
     let file = out_path_base.with_extension("png");
     let file_to_return = file.clone();
@@ -745,17 +748,45 @@ fn write_cluster_scatter_png(
         .draw()
         .map_err(|e| e.to_string())?;
 
-    // Draw points by label color
-    let palette = [&RED, &BLUE, &GREEN, &MAGENTA, &CYAN, &BLACK];
-    chart
-        .draw_series(pts.iter().zip(labels.iter()).map(|(&(x, y), &lab)| {
-            let c = palette[lab % palette.len()];
-            Circle::new((x, y), 3, c.filled())
-        }))
-        .map_err(|e| e.to_string())?;
+    // Helper: color by genotype name
+    let color_for = |nm: &str| -> RGBColor {
+        match nm {
+            "AA" => RED,          // homozygous red
+            "AB" => BLUE,         // heterozygous
+            "BB" => GREEN,        // homozygous green
+            _    => BLACK,
+        }
+    };
 
+    // Draw one series per cluster so we can attach legend entries
+    for (j, _mu) in means.iter().enumerate() {
+        let nm = if j < names.len() { names[j] } else { "" };
+        let col = color_for(nm);
+        chart
+            .draw_series(
+                pts.iter()
+                    .zip(labels.iter())
+                    .filter_map(|(&(x, y), &lab)| if lab == j { Some((x, y)) } else { None })
+                    .map(|(x, y)| Circle::new((x, y), 3, col.filled())),
+            )
+            .map_err(|e| e.to_string())?
+            .label(if nm.is_empty() { format!("C{}", j) } else { nm.to_string() })
+            .legend(move |(x, y)| Circle::new((x, y), 5, col.filled()));
+    }
+
+    // Mark cluster means
     chart
         .draw_series(means.iter().map(|&(x, y)| Cross::new((x, y), 7, &BLACK)))
+        .map_err(|e| e.to_string())?;
+
+    // Legend in top-right
+    chart
+        .configure_series_labels()
+        .position(SeriesLabelPosition::UpperRight)
+        .border_style(&BLACK)
+        .background_style(WHITE.mix(0.85))
+        .label_font(("sans-serif", 14))
+        .draw()
         .map_err(|e| e.to_string())?;
 
     root.present().map_err(|e| e.to_string())?;
