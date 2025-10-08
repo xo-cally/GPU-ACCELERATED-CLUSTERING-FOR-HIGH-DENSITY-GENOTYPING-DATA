@@ -11,9 +11,7 @@ pub enum FeatureSpace {
 }
 
 #[inline]
-fn ln1p_u16(v: u16) -> f64 {
-    (v as f64 + 1.0).ln()
-}
+pub fn ln1p_u16(v: u16) -> f64 { (v as f64 + 1.0).ln() }
 
 #[inline]
 pub fn to_features_from_logs(fs: &FeatureSpace, lnr: f64, lng: f64) -> (f64, f64) {

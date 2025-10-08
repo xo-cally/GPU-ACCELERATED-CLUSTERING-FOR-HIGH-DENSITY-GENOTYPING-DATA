@@ -23,10 +23,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut plot_first_snps: usize = 20;  // default: plot first N SNPs
     let mut first_pairs: Option<usize> = None; // cap number of sample pairs processed
 
-    // NEW: normalization toggles / inputs
+    // normalization toggles / inputs
     let mut norm_affine = false;
     let mut norm_illumina = false;
     let mut bead_pools_csv: Option<PathBuf> = None;
+
+    let mut snp_first_n: Option<usize> = None;
+    let mut snp_sample_n: Option<usize> = None;
 
     // --- CLI ---
     let mut args = std::env::args().skip(1);
@@ -67,8 +70,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             "--restarts"  => restarts  = args.next().unwrap().parse().unwrap(),
             "--first"     => first_pairs = args.next().and_then(|v| v.parse().ok()),
             "--plot-first-snps" => plot_first_snps = args.next().unwrap().parse().unwrap(),
+            "--max-snps" => snp_first_n = args.next().and_then(|v| v.parse().ok()),
+            "--sample-snps" => snp_sample_n = args.next().and_then(|v| v.parse().ok()),
 
-            // NEW: normalization flags
+            // normalization flags
             "--norm-affine" => { norm_affine = true; }
             "--norm-illumina" => { norm_illumina = true; }
             "--bead-pools" => {
@@ -95,6 +100,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("Normalization: norm_affine={} norm_illumina={} bead_pools_csv={:?}",
         norm_affine, norm_illumina, bead_pools_csv);
 
+    match (snp_sample_n, snp_first_n) {
+        (Some(n), _) => println!("SNPs: sampling {} (seed={}) from common set", n, seed),
+        (None, Some(n)) => println!("SNPs: taking first {} (lexicographic Illumina IDs)", n),
+        _ => println!("SNPs: using all common SNPs"),
+    }
+
+
     let cfg = CohortCfg {
         feature_space: feat,
         r_min,
@@ -107,10 +119,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         restarts,
         plot_first_snps,
 
-        // NEW
         norm_affine,
         norm_illumina,
         bead_pools_csv,
+
+        snp_first_n,
+        snp_sample_n,
     };
 
     let (calls, qc) = run_from_pairs(&pairs, &out_dir, cfg)

@@ -3,6 +3,7 @@ use std::path::Path;
 use crate::pairs::find_pairs_sorted;
 use crate::idat::read_idat_any;
 use crate::model::rmin_from_lnxy_sum;
+use crate::model::ln1p_u16;
 
 pub fn compute_rmin_like_pipeline(root: &Path, first_pairs: Option<usize>) -> Result<u32, String> {
     let mut pairs = find_pairs_sorted(root);
@@ -20,8 +21,8 @@ pub fn compute_rmin_like_pipeline(root: &Path, first_pairs: Option<usize>) -> Re
             return Err(format!("empty pair: {} / {}", gpath.display(), rpath.display()));
         }
 
-        let ln_x: Vec<f64> = r.means[..n].iter().map(|&v| (v as f64 + 1.0).ln()).collect();
-        let ln_y: Vec<f64> = g.means[..n].iter().map(|&v| (v as f64 + 1.0).ln()).collect();
+        let ln_x: Vec<f64> = r.means[..n].iter().map(|&v| ln1p_u16(v)).collect();
+        let ln_y: Vec<f64> = g.means[..n].iter().map(|&v| ln1p_u16(v)).collect();
         let z: Vec<f64> = ln_x.iter().zip(&ln_y).map(|(xr, yg)| xr + yg).collect();
 
         per_sample.push(rmin_from_lnxy_sum(&z));

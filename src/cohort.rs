@@ -8,6 +8,10 @@ use rayon::prelude::*;
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use plotters::prelude::*;
+use rand::seq::SliceRandom;
+use rand::SeedableRng;
+use crate::model::ln1p_u16;
+
 
 // =============== PMMode / Config ===============
 pub enum PMMode {
@@ -30,7 +34,12 @@ pub struct CohortCfg {
     // Normalization toggles + bead pools
     pub norm_affine: bool,              // whitening path
     pub norm_illumina: bool,            // Illumina-style per-pool transform
-    pub bead_pools_csv: Option<PathBuf> // CSV: IlluminaID,pool_id (u32,u16)
+    pub bead_pools_csv: Option<PathBuf>, // CSV: IlluminaID,pool_id (u32,u16)
+
+    // SNP limiting
+    pub snp_first_n: Option<usize>,   // take first N SNPs after intersect+sort
+    pub snp_sample_n: Option<usize>,  // OR: take a random sample of N SNPs (seeded)
+
 }
 
 // =============== Sample cache ===============
@@ -396,16 +405,32 @@ pub fn run_from_pairs(
 
     let samples = load_samples(pairs)?; let s = samples.len();
     if s < 2 { return Err("need >=2 samples".into()); }
-    let ids = common_ids(&samples);
+    let mut ids = common_ids(&samples);
     if ids.is_empty() { return Err("no common SNPs".into()); }
+
+    // Apply SNP limiting (sampling takes precedence if both are set)
+    if let Some(n) = cfg.snp_sample_n {
+        if ids.len() > n {
+            let mut rng = rand::rngs::StdRng::seed_from_u64(cfg.seed);
+            ids.shuffle(&mut rng);
+            ids.truncate(n);
+            ids.sort_unstable(); // keep plots/files in increasing ID order
+        }
+    } else if let Some(n) = cfg.snp_first_n {
+        if ids.len() > n {
+            ids.truncate(n);
+        }
+    }
+
 
     // Precompute ln1p(Red/Green) for features/r_min
     let mut ln_x: Vec<Vec<f64>> = Vec::with_capacity(s);
     let mut ln_y: Vec<Vec<f64>> = Vec::with_capacity(s);
     for sd in &samples {
-        ln_x.push(sd.x_red.iter().map(|&v| (v as f64 + 1.0).ln()).collect());
-        ln_y.push(sd.y_grn.iter().map(|&v| (v as f64 + 1.0).ln()).collect());
+        ln_x.push(sd.x_red.iter().map(|&v| ln1p_u16(v)).collect());
+        ln_y.push(sd.y_grn.iter().map(|&v| ln1p_u16(v)).collect());
     }
+
 
     // --- Normalization setup (bead pools + mode + transforms) ---
     let bead_pools: HashMap<u32, u16> = if let Some(ref p) = cfg.bead_pools_csv {
