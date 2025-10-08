@@ -13,4 +13,5 @@
 *.idat
 *.txt
 *.csv
+*.sh
 /data*/
