@@ -237,7 +237,7 @@ pub fn rmin_from_lnxy_sum(z: &[f64]) -> u32 {
     }
 
     let raw = (t.exp() - 1.0).max(0.0);
-    raw.round().clamp(300.0, 1000.0) as u32
+    raw.round().clamp(300.0, 500.0) as u32
 }
 
 pub fn auto_tau_from_posteriors(ps: Vec<f64>, alpha: f64) -> f64 {
