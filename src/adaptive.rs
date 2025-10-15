@@ -61,7 +61,7 @@ pub fn load_bad_snps(path: &Path) -> HashSet<u32> {
     set
 }
 
-pub fn save_bad_snps(path: &Path, ids: &HashSet<u32>) -> Result<(), String> {
+pub fn save_bad_snps(path: &Path, ids: &std::collections::HashSet<u32>) -> Result<(), String> {
     let mut lines: Vec<String> = ids.iter().cloned().map(|v| v.to_string()).collect();
     lines.sort();
     std::fs::write(path, lines.join("\n")).map_err(|e| e.to_string())

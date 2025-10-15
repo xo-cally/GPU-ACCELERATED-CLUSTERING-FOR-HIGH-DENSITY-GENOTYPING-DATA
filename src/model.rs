@@ -1,30 +1,25 @@
 use rand::{rngs::StdRng, Rng, SeedableRng};
 use std::cmp::Ordering;
 
-// ---- Feature spaces ----
+// ---- Feature space (ThetaR only) ----
 #[derive(Debug, Clone, Copy)]
-pub enum FeatureSpace {
-    /// (ln(R), ln(G))
-    XYLog1p,
-    /// (theta*w_theta, ln(R+G+1)*w_r) where theta = atan2(G,R)/π in [0,1]
-    ThetaR { w_theta: f64, w_r: f64 },
+pub struct ThetaR {
+    pub w_theta: f64,
+    pub w_r: f64,
 }
 
 #[inline]
 pub fn ln1p_u16(v: u16) -> f64 { (v as f64 + 1.0).ln() }
 
 #[inline]
-pub fn to_features_from_logs(fs: &FeatureSpace, lnr: f64, lng: f64) -> (f64, f64) {
-    match *fs {
-        FeatureSpace::XYLog1p => (lnr, lng),
-        FeatureSpace::ThetaR { w_theta, w_r } => {
-            let r = lnr.exp() - 1.0;
-            let g = lng.exp() - 1.0;
-            let theta = g.atan2(r) / std::f64::consts::PI; // [0,1]
-            let rr = (r + g + 1.0).ln();
-            (theta * w_theta, rr * w_r)
-        }
-    }
+pub fn to_features_from_logs(fs: &ThetaR, lnr: f64, lng: f64) -> (f64, f64) {
+    // theta in [0,1], r = ln(R+G+1)
+    let r = lnr.exp() - 1.0;
+    let g = lng.exp() - 1.0;
+    // Rescale theta to [0,1] in the positive quadrant
+    let theta = (2.0 * g.atan2(r)) / std::f64::consts::PI;
+    let rr = (r + g + 1.0).ln();
+    (theta * fs.w_theta, rr * fs.w_r)
 }
 
 // ---- 2D diagonal-covariance GMM ----
@@ -178,8 +173,8 @@ pub fn maha2_diag(p: (f64, f64), mu: (f64, f64), var: (f64, f64)) -> f64 {
 }
 
 // ---- r_min auto & FDR-style tau ----
+// z must be ln(R+G+1) per SNP for one sample.
 pub fn rmin_from_lnxy_sum(z: &[f64]) -> u32 {
-    // 2-comp 1D GMM on z = ln((R+1)+(G+1))
     #[derive(Clone, Copy, Debug)]
     struct G1 { w0:f64, mu0:f64, s0:f64, w1:f64, mu1:f64, s1:f64 }
 
@@ -237,7 +232,7 @@ pub fn rmin_from_lnxy_sum(z: &[f64]) -> u32 {
     }
 
     let raw = (t.exp() - 1.0).max(0.0);
-    raw.round().clamp(300.0, 500.0) as u32
+    raw.round().clamp(300.0, 800.0) as u32
 }
 
 pub fn auto_tau_from_posteriors(ps: Vec<f64>, alpha: f64) -> f64 {

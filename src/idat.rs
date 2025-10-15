@@ -1,3 +1,4 @@
+// src/idat.rs
 use byteorder::{LittleEndian, ReadBytesExt};
 use flate2::read::GzDecoder;
 use std::fs::File;

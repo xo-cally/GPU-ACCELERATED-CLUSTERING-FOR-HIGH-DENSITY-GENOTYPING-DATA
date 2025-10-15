@@ -2,51 +2,64 @@ use chrono::Local;
 use std::path::PathBuf;
 
 use genotyping_pipeline::pairs::find_pairs_sorted;
-use genotyping_pipeline::model::FeatureSpace;
+use genotyping_pipeline::model::ThetaR;
 use genotyping_pipeline::cohort::{run_from_pairs, CohortCfg, PMMode};
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
-    // Defaults
+    // ===== Defaults =====
     let mut root = PathBuf::from("/dataC/idat");
     let mut out_dir = PathBuf::from(format!("results/{}", Local::now().format("%Y%m%d_%H%M")));
 
-    // feature + gates defaults
-    let mut feat = FeatureSpace::XYLog1p;
-    let mut r_min: u32 = 0;                 // 0 => auto (per-sample 1D-GMM median)
-    let mut p_mode: PMMode = PMMode::Auto { alpha: 0.005 };
-    let mut alpha = 0.005f64;               // when p_mode=Auto
-    let mut max_maha = 6.0f64;              // radius gate (sqrt of chi^2_2)
+    // ThetaR only
+    let mut feat = ThetaR { w_theta: 1.0, w_r: 0.45 };
+
+    // ===== Fixed gates (pinned) =====
+    let mut r_min: u32 = 500;                         // fixed r_min
+    let mut p_mode: PMMode = PMMode::Fixed(0.85);     // fixed p_min (τ)
+
+    // Other gates/knobs
+    let mut max_maha = 6.0f64;
 
     let (mut k_max, mut max_iters, mut tol, mut seed, mut restarts) =
         (3usize, 200usize, 1e-6f64, 42u64, 3usize);
 
-    let mut plot_first_snps: usize = 20;  // default: plot first N SNPs
-    let mut first_pairs: Option<usize> = None; // cap number of sample pairs processed
+    let mut plot_first_snps: usize = 20;
+    let mut first_pairs: Option<usize> = None;
 
-    // normalization toggles / inputs
-    let mut norm_affine = false;
-    let mut norm_illumina = false;
-    let mut bead_pools_csv: Option<PathBuf> = None;
-
+    // SNP limiting
     let mut snp_first_n: Option<usize> = None;
     let mut snp_sample_n: Option<usize> = None;
 
+    // ===== Learning / persistence (KEEP ON) =====
+    let mut feedback_in: Option<PathBuf> = None;
+    let mut feedback_out: Option<PathBuf> = None;
+    let mut bad_snps_in: Option<PathBuf> = None;
+    let mut bad_snps_out: Option<PathBuf> = None;
+    let mut drop_bad_snps = true;           // keep excluding known-bad SNPs
+    let mut nocall_bad_thresh: f64 = 0.35;  // mark SNP as bad if NoCall@τ rate ≥ 35%
+
     // --- CLI ---
+    let mut alpha = 0.005f64; // only used if --p-min auto
     let mut args = std::env::args().skip(1);
+    let mut debug_snp: Option<u32> = None;
     while let Some(a) = args.next() {
         match a.as_str() {
             "--root"      => root    = PathBuf::from(args.next().unwrap()),
             "--out-dir"   => out_dir = PathBuf::from(args.next().unwrap()),
+
+            // ThetaR only (compat flag)
             "--feat" => {
                 let v = args.next().unwrap();
-                if v == "xy" {
-                    feat = FeatureSpace::XYLog1p;
-                } else if v == "thetar" {
-                    let wt: f64 = args.next().unwrap().parse().unwrap();
-                    let wr: f64 = args.next().unwrap().parse().unwrap();
-                    feat = FeatureSpace::ThetaR { w_theta: wt, w_r: wr };
+                if v != "thetar" {
+                    eprintln!("WARN: only 'thetar' is supported; using ThetaR.");
                 }
             }
+            "--thetar" => {
+                let wt: f64 = args.next().unwrap().parse().unwrap();
+                let wr: f64 = args.next().unwrap().parse().unwrap();
+                feat = ThetaR { w_theta: wt, w_r: wr };
+            }
+
             "--r-min"     => r_min     = args.next().unwrap().parse().unwrap(),
             "--p-min" => {
                 let v = args.next().unwrap();
@@ -70,22 +83,21 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             "--restarts"  => restarts  = args.next().unwrap().parse().unwrap(),
             "--first"     => first_pairs = args.next().and_then(|v| v.parse().ok()),
             "--plot-first-snps" => plot_first_snps = args.next().unwrap().parse().unwrap(),
-            "--max-snps" => snp_first_n = args.next().and_then(|v| v.parse().ok()),
+            "--max-snps"  => snp_first_n = args.next().and_then(|v| v.parse().ok()),
             "--sample-snps" => snp_sample_n = args.next().and_then(|v| v.parse().ok()),
 
-            // normalization flags
-            "--norm-affine" => { norm_affine = true; }
-            "--norm-illumina" => { norm_illumina = true; }
-            "--bead-pools" => {
-                bead_pools_csv = Some(PathBuf::from(args.next().unwrap()));
-            }
+            // Learning flags
+            "--feedback-in"   => { feedback_in   = Some(PathBuf::from(args.next().unwrap())); }
+            "--feedback-out"  => { feedback_out  = Some(PathBuf::from(args.next().unwrap())); }
+            "--bad-snps-in"   => { bad_snps_in   = Some(PathBuf::from(args.next().unwrap())); }
+            "--bad-snps-out"  => { bad_snps_out  = Some(PathBuf::from(args.next().unwrap())); }
+            "--drop-bad-snps" => { drop_bad_snps = true; }
+            "--nocall-bad-thresh" => { nocall_bad_thresh = args.next().unwrap().parse().unwrap(); }
+
+            "--debug-snp" => { debug_snp = args.next().and_then(|v| v.parse().ok()); }
 
             _ => {}
         }
-    }
-
-    if norm_affine && norm_illumina {
-        eprintln!("WARN: --norm-affine and --norm-illumina both set; Illumina transform will be used.");
     }
 
     std::fs::create_dir_all(&out_dir)?;
@@ -97,15 +109,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     if let Some(n) = first_pairs { if pairs.len() > n { pairs.truncate(n); } }
     println!("Found {} pairs under {}", pairs.len(), root.display());
     println!("Plots: first {} SNPs will be rendered into {}/plots/", plot_first_snps, out_dir.display());
-    println!("Normalization: norm_affine={} norm_illumina={} bead_pools_csv={:?}",
-        norm_affine, norm_illumina, bead_pools_csv);
 
     match (snp_sample_n, snp_first_n) {
         (Some(n), _) => println!("SNPs: sampling {} (seed={}) from common set", n, seed),
         (None, Some(n)) => println!("SNPs: taking first {} (lexicographic Illumina IDs)", n),
         _ => println!("SNPs: using all common SNPs"),
     }
-
 
     let cfg = CohortCfg {
         feature_space: feat,
@@ -119,12 +128,19 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         restarts,
         plot_first_snps,
 
-        norm_affine,
-        norm_illumina,
-        bead_pools_csv,
-
+        // SNP limiting
         snp_first_n,
         snp_sample_n,
+
+        // Learning / persistence
+        feedback_in,
+        feedback_out,
+        bad_snps_in,
+        bad_snps_out,
+        drop_bad_snps,
+        nocall_bad_thresh,
+
+        debug_snp,
     };
 
     let (calls, qc) = run_from_pairs(&pairs, &out_dir, cfg)
