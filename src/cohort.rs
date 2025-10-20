@@ -10,7 +10,11 @@ use rand::seq::SliceRandom;
 use rand::SeedableRng;
 use rayon::prelude::*;
 use std::collections::{HashMap, HashSet};
+use std::fs::OpenOptions;
 use std::path::{Path, PathBuf};
+
+// ================== Output toggles ==================
+const WRITE_CALLS_CSV: bool = false; // <- turn off cohort_calls.csv
 
 // =============== PMMode / Config ===============
 pub enum PMMode {
@@ -53,47 +57,88 @@ struct SampleData {
     ids: Vec<u32>,
     x_red: Vec<u16>,
     y_grn: Vec<u16>,
-    pos: HashMap<u32, usize>,
 }
 
+/// Parallel load of samples (no per-SNP position maps here).
 fn load_samples(pairs: &[(PathBuf, PathBuf)]) -> Result<Vec<SampleData>, String> {
-    let mut out = Vec::with_capacity(pairs.len());
-    for (gpath, rpath) in pairs {
-        let g = read_idat_any(gpath).map_err(|e| format!("{}: {}", gpath.display(), e))?;
-        let r = read_idat_any(rpath).map_err(|e| format!("{}: {}", rpath.display(), e))?;
-        let n = g.means.len().min(r.means.len());
-        if n == 0 {
-            return Err("empty pair".into());
-        }
-        let mut pos = HashMap::with_capacity(n);
-        for (i, &id) in g.illumina_ids.iter().take(n).enumerate() {
-            pos.insert(id, i);
-        }
-        let stem = gpath.file_stem().and_then(|s| s.to_str()).unwrap_or("sample");
-        let name = stem.strip_suffix("_Grn").unwrap_or(stem).to_string();
-        out.push(SampleData {
-            name,
-            ids: g.illumina_ids[..n].to_vec(),
-            x_red: r.means[..n].to_vec(),
-            y_grn: g.means[..n].to_vec(),
-            pos,
-        });
-    }
-    Ok(out)
+    // Preserve the original order of `pairs` by carrying the index through.
+    let mut temp: Vec<(usize, SampleData)> = pairs
+        .par_iter()
+        .enumerate()
+        .map(|(idx, (gpath, rpath))| -> Result<(usize, SampleData), String> {
+            let g = read_idat_any(gpath).map_err(|e| format!("{}: {}", gpath.display(), e))?;
+            let r = read_idat_any(rpath).map_err(|e| format!("{}: {}", rpath.display(), e))?;
+            let n = g.means.len().min(r.means.len());
+            if n == 0 {
+                return Err("empty pair".into());
+            }
+            let stem = gpath.file_stem().and_then(|s| s.to_str()).unwrap_or("sample");
+            let name = stem.strip_suffix("_Grn").unwrap_or(stem).to_string();
+            Ok((
+                idx,
+                SampleData {
+                    name,
+                    ids: g.illumina_ids[..n].to_vec(),
+                    x_red: r.means[..n].to_vec(),
+                    y_grn: g.means[..n].to_vec(),
+                },
+            ))
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+
+    temp.sort_by_key(|(i, _)| *i);
+    Ok(temp.into_iter().map(|(_, s)| s).collect())
 }
 
+/// Intersection of sorted ID lists using k-way merge (two-pointer per step).
 fn common_ids(samples: &[SampleData]) -> Vec<u32> {
     if samples.is_empty() {
         return vec![];
     }
-    let mut set: HashSet<u32> = samples[0].ids.iter().copied().collect();
+    // Start with first sample's sorted ids
+    let mut acc: Vec<u32> = samples[0].ids.clone();
     for s in &samples[1..] {
-        let t: HashSet<u32> = s.ids.iter().copied().collect();
-        set = set.intersection(&t).copied().collect();
+        let (a, b) = (&acc, &s.ids);
+        let mut i = 0usize;
+        let mut j = 0usize;
+        let mut out = Vec::with_capacity(a.len().min(b.len()));
+        while i < a.len() && j < b.len() {
+            use std::cmp::Ordering::*;
+            match a[i].cmp(&b[j]) {
+                Less => i += 1,
+                Greater => j += 1,
+                Equal => {
+                    out.push(a[i]);
+                    i += 1;
+                    j += 1;
+                }
+            }
+        }
+        acc = out;
+        if acc.is_empty() {
+            break;
+        }
     }
-    let mut v: Vec<u32> = set.into_iter().collect();
-    v.sort_unstable();
-    v
+    acc
+}
+
+/// Build, for each sample, a compact vector of positions aligned to `ids`.
+/// Uses binary_search on each sample’s `ids` (Illumina IDs are typically sorted).
+fn build_positions_for_ids(samples: &[SampleData], ids: &[u32]) -> Vec<Vec<usize>> {
+    samples
+        .par_iter()
+        .map(|s| {
+            let mut pos = Vec::with_capacity(ids.len());
+            for &id in ids {
+                let p = s
+                    .ids
+                    .binary_search(&id)
+                    .expect("id from intersection not found in sample.ids");
+                pos.push(p);
+            }
+            pos
+        })
+        .collect()
 }
 
 // =============== K=1 baseline & choose_k ===============
@@ -164,18 +209,12 @@ fn choose_k(
     }
 }
 
-/// Strict component -> genotype mapping:
-/// Sort components by *unscaled* theta mean and assign:
-///   left -> "BB", middle -> "AB", right -> "AA"
-/// For k=2: left -> "BB", right -> "AA"
-/// For k=1: decide by the single mean theta.
+/// Strict component -> genotype mapping
 fn map_labels_for_snp_strict(means: &[(f64, f64)], w_theta: f64) -> Vec<&'static str> {
     let k = means.len();
     let mut names = vec![""; k];
 
-    // Guard against zero scaling; we only use w_theta to unscale x back to raw theta
     let wth = w_theta.max(1e-9);
-
     if k == 1 {
         let t = means[0].0 / wth;
         names[0] = if t <= 0.33 { "BB" } else if t >= 0.67 { "AA" } else { "AB" };
@@ -211,8 +250,6 @@ fn safe_lab_index(snp_id: u32, jlab: usize, k: usize) -> usize {
     }
 }
 
-/// Guard that checks if a sample's θ is geometrically consistent with the label
-/// using dynamic midpoints from this SNP's component-θ means.
 #[inline]
 fn theta_guard_ok(
     means: &[(f64, f64)],
@@ -258,80 +295,117 @@ pub fn run_from_pairs(
     out_dir: &Path,
     cfg: CohortCfg,
 ) -> Result<(PathBuf, PathBuf), String> {
+    use crate::profiler::Profiler;
+    let mut prof = Profiler::new();
+
     std::fs::create_dir_all(out_dir).map_err(|e| e.to_string())?;
     let plots_dir = out_dir.join("plots");
     if cfg.plot_first_snps > 0 {
         std::fs::create_dir_all(&plots_dir).map_err(|e| e.to_string())?;
     }
 
-    // Load samples
-    let samples = load_samples(pairs)?;
+    // Load samples (parallel)
+    let samples = {
+        let _s = prof.scope("load_samples");
+        load_samples(pairs)?
+    };
     let s = samples.len();
     if s < 2 {
         return Err("need >=2 samples".into());
     }
-    let mut ids = common_ids(&samples);
+
+    let mut ids = {
+        let _s = prof.scope("common_ids");
+        common_ids(&samples)
+    };
     if ids.is_empty() {
         return Err("no common SNPs".into());
     }
 
     // Load learning state
-    let mut fb = if let Some(ref p) = cfg.feedback_in {
-        adaptive::load_feedback(p)
-    } else {
-        HashMap::new()
+    let mut fb = {
+        let _s = prof.scope("load_feedback");
+        if let Some(ref p) = cfg.feedback_in {
+            adaptive::load_feedback(p)
+        } else {
+            HashMap::new()
+        }
     };
-    let mut bad = if let Some(ref p) = cfg.bad_snps_in {
-        adaptive::load_bad_snps(p)
-    } else {
-        HashSet::new()
+    let mut bad = {
+        let _s = prof.scope("load_bad_snps");
+        if let Some(ref p) = cfg.bad_snps_in {
+            adaptive::load_bad_snps(p)
+        } else {
+            HashSet::new()
+        }
     };
 
     // Optionally drop known bad SNPs now
-    if cfg.drop_bad_snps && !bad.is_empty() {
-        ids.retain(|id| !bad.contains(id));
+    {
+        let _s = prof.scope("drop_bad_snps");
+        if cfg.drop_bad_snps && !bad.is_empty() {
+            ids.retain(|id| !bad.contains(id));
+        }
     }
 
     // Apply SNP limiting (sampling takes precedence)
-    if let Some(n) = cfg.snp_sample_n {
-        if ids.len() > n {
-            let mut rng = rand::rngs::StdRng::seed_from_u64(cfg.seed);
-            ids.shuffle(&mut rng);
-            ids.truncate(n);
-            ids.sort_unstable();
-        }
-    } else if let Some(n) = cfg.snp_first_n {
-        if ids.len() > n {
-            ids.truncate(n);
+    {
+        let _s = prof.scope("limit_snps");
+        if let Some(n) = cfg.snp_sample_n {
+            if ids.len() > n {
+                let mut rng = rand::rngs::StdRng::seed_from_u64(cfg.seed);
+                ids.shuffle(&mut rng);
+                ids.truncate(n);
+                ids.sort_unstable();
+            }
+        } else if let Some(n) = cfg.snp_first_n {
+            if ids.len() > n {
+                ids.truncate(n);
+            }
         }
     }
 
+    // Build compact per-sample positions aligned with *final* ids
+    let pos_index: Vec<Vec<usize>> = {
+        let _s = prof.scope("build_positions_after_limiting");
+        build_positions_for_ids(&samples, &ids)
+    };
+
     // r_min (0 => auto via per-sample ln(R+G+1) GMM and cohort median)
-    let r_min = if cfg.r_min == 0 {
-        let mut per_sample = Vec::with_capacity(s);
-        for si in 0..s {
-            let n = samples[si].x_red.len().min(samples[si].y_grn.len());
-            let mut z: Vec<f64> = Vec::with_capacity(n);
-            for k in 0..n {
-                let rr = samples[si].x_red[k] as u32;
-                let gg = samples[si].y_grn[k] as u32;
-                z.push(((rr + gg + 1) as f64).ln());
+    let r_min = {
+        let _s = prof.scope("compute_r_min");
+        if cfg.r_min == 0 {
+            let mut per_sample = Vec::with_capacity(s);
+            for si in 0..s {
+                let n = samples[si].x_red.len().min(samples[si].y_grn.len());
+                let mut z: Vec<f64> = Vec::with_capacity(n);
+                for k in 0..n {
+                    let rr = samples[si].x_red[k] as u32;
+                    let gg = samples[si].y_grn[k] as u32;
+                    z.push(((rr + gg + 1) as f64).ln());
+                }
+                per_sample.push(rmin_from_lnxy_sum(&z));
             }
-            per_sample.push(rmin_from_lnxy_sum(&z));
+            per_sample.sort_unstable();
+            per_sample[per_sample.len() / 2]
+        } else {
+            cfg.r_min
         }
-        per_sample.sort_unstable();
-        per_sample[per_sample.len() / 2]
-    } else {
-        cfg.r_min
     };
 
     // Prepare writers (calls & QC)
     let calls_path = out_dir.join("cohort_calls.csv");
     let qc_path = out_dir.join("cohort_qc_summary.csv");
-    let mut w = Writer::from_path(&calls_path).map_err(|e| e.to_string())?;
-    let mut header = vec!["SNP_ID".to_string()];
-    header.extend(samples.iter().map(|s| s.name.clone()));
-    w.write_record(&header).map_err(|e| e.to_string())?;
+
+    // Header for calls CSV (only if enabled)
+    if WRITE_CALLS_CSV {
+        let _s = prof.scope("write_calls_header");
+        let mut w = Writer::from_path(&calls_path).map_err(|e| e.to_string())?;
+        let mut header = vec!["SNP_ID".to_string()];
+        header.extend(samples.iter().map(|s| s.name.clone()));
+        w.write_record(&header).map_err(|e| e.to_string())?;
+        w.flush().map_err(|e| e.to_string())?;
+    }
 
     // stats per sample
     #[derive(Default)]
@@ -364,11 +438,24 @@ pub fn run_from_pairs(
     let block = 10_000.min(m).max(1);
     let mut plots_emitted: usize = 0;
 
+    // Reopen calls writer in APPEND mode (or disable entirely)
+    let mut w_opt: Option<csv::Writer<Box<dyn std::io::Write>>> = if WRITE_CALLS_CSV {
+        let file = OpenOptions::new()
+            .append(true)
+            .create(true)
+            .open(&calls_path)
+            .map_err(|e| e.to_string())?;
+        Some(Writer::from_writer(Box::new(file)))
+    } else {
+        None
+    };
+
     for chunk_start in (0..m).step_by(block) {
         let end = (chunk_start + block).min(m);
 
         #[derive(Clone)]
         struct Row {
+            idx: usize, // index into ids (so we can index pos_index later)
             id: u32,
             raw: Vec<u32>,
             labs: Vec<usize>,
@@ -377,89 +464,99 @@ pub fn run_from_pairs(
             vars: Vec<(f64, f64)>,
         }
 
-        let rows: Vec<Row> = (chunk_start..end)
-            .into_par_iter()
-            .map(|j| {
-                let id = ids[j];
-                let mut pts = Vec::with_capacity(s);
-                let mut raw = Vec::with_capacity(s);
+        // ---- 1) Cluster chunk in parallel
+        let rows: Vec<Row> = {
+            let _s = prof.scope("chunk_cluster_em_bic");
+            (chunk_start..end)
+                .into_par_iter()
+                .map(|j| {
+                    let id = ids[j];
+                    let mut pts = Vec::with_capacity(s);
+                    let mut raw = Vec::with_capacity(s);
 
-                // Features from raw intensities
-                for si in 0..s {
-                    let p = *samples[si].pos.get(&id).unwrap();
-                    let red = samples[si].x_red[p] as f64;
-                    let grn = samples[si].y_grn[p] as f64;
-
-                    let lnr = (red + 1.0).ln();
-                    let lng = (grn + 1.0).ln();
-                    pts.push(to_features_from_logs(&cfg.feature_space, lnr, lng));
-
-                    // Raw intensity sum for r_min gate
-                    let rsum = (samples[si].x_red[p] as u32) + (samples[si].y_grn[p] as u32);
-                    raw.push(rsum);
-                }
-
-                // 1) pick k with BIC
-                let mut model = choose_k(&pts, cfg.k_max, cfg.max_iters, cfg.tol, cfg.seed, cfg.restarts);
-
-                // 2) enforce minimum θ separation (and tiny-weight veto)
-                const GAP3_TO_2: f64 = 0.035;
-                const GAP2_TO_1: f64 = 0.020;
-                const MIN_W: f64 = 0.03;
-
-                let sorted_thetas = |means: &[(f64,f64)], w_theta: f64| -> Vec<f64> {
-                    let wth = w_theta.max(1e-9);
-                    let mut t: Vec<f64> = means.iter().map(|m| m.0 / wth).collect();
-                    t.sort_by(|a,b| a.partial_cmp(b).unwrap());
-                    t
-                };
-
-                {
-                    let wth = cfg.feature_space.w_theta;
-
-                    if model.k > 1 && model.weights.iter().any(|&w| w < MIN_W) {
-                        model = if model.k == 3 {
-                            fit_diag_restarts(&pts, 2, cfg.max_iters, cfg.tol, cfg.seed, cfg.restarts)
-                        } else {
-                            fit_k1(&pts)
-                        };
+                    for si in 0..s {
+                        let p = pos_index[si][j];
+                        let red = samples[si].x_red[p] as f64;
+                        let grn = samples[si].y_grn[p] as f64;
+                        let lnr = (red + 1.0).ln();
+                        let lng = (grn + 1.0).ln();
+                        pts.push(to_features_from_logs(&cfg.feature_space, lnr, lng));
+                        let rsum = (samples[si].x_red[p] as u32) + (samples[si].y_grn[p] as u32);
+                        raw.push(rsum);
                     }
 
-                    let t = sorted_thetas(&model.means, wth);
-                    if model.k == 3 {
-                        let min_gap = (t[1] - t[0]).abs().min((t[2] - t[1]).abs());
-                        if min_gap < GAP3_TO_2 {
-                            let m2  = fit_diag_restarts(&pts, 2, cfg.max_iters, cfg.tol, cfg.seed, cfg.restarts);
-                            let t2  = sorted_thetas(&m2.means, wth);
-                            let gap = (t2[1] - t2[0]).abs();
-                            model = if gap < GAP2_TO_1 { fit_k1(&pts) } else { m2 };
+                    let mut model =
+                        choose_k(&pts, cfg.k_max, cfg.max_iters, cfg.tol, cfg.seed, cfg.restarts);
+
+                    const GAP3_TO_2: f64 = 0.035;
+                    const GAP2_TO_1: f64 = 0.020;
+                    const MIN_W: f64 = 0.03;
+                    let sorted_thetas = |means: &[(f64, f64)], w_theta: f64| -> Vec<f64> {
+                        let wth = w_theta.max(1e-9);
+                        let mut t: Vec<f64> = means.iter().map(|m| m.0 / wth).collect();
+                        t.sort_by(|a, b| a.partial_cmp(b).unwrap());
+                        t
+                    };
+                    {
+                        let wth = cfg.feature_space.w_theta;
+                        if model.k > 1 && model.weights.iter().any(|&w| w < MIN_W) {
+                            model = if model.k == 3 {
+                                fit_diag_restarts(
+                                    &pts,
+                                    2,
+                                    cfg.max_iters,
+                                    cfg.tol,
+                                    cfg.seed,
+                                    cfg.restarts,
+                                )
+                            } else {
+                                fit_k1(&pts)
+                            };
                         }
-                    } else if model.k == 2 {
-                        let gap = (t[1] - t[0]).abs();
-                        if gap < GAP2_TO_1 {
-                            model = fit_k1(&pts);
+                        let t = sorted_thetas(&model.means, wth);
+                        if model.k == 3 {
+                            let min_gap =
+                                (t[1] - t[0]).abs().min((t[2] - t[1]).abs());
+                            if min_gap < GAP3_TO_2 {
+                                let m2 = fit_diag_restarts(
+                                    &pts,
+                                    2,
+                                    cfg.max_iters,
+                                    cfg.tol,
+                                    cfg.seed,
+                                    cfg.restarts,
+                                );
+                                let t2 = sorted_thetas(&m2.means, wth);
+                                let gap = (t2[1] - t2[0]).abs();
+                                model = if gap < GAP2_TO_1 { fit_k1(&pts) } else { m2 };
+                            }
+                        } else if model.k == 2 {
+                            let gap = (t[1] - t[0]).abs();
+                            if gap < GAP2_TO_1 {
+                                model = fit_k1(&pts);
+                            }
                         }
                     }
-                }
 
-                // 3) label with the (possibly demoted) model
-                let (mut labs, mut post) = (Vec::new(), Vec::new());
-                predict(&model, &pts, &mut labs, &mut post);
+                    let (mut labs, mut post) = (Vec::new(), Vec::new());
+                    predict(&model, &pts, &mut labs, &mut post);
 
-                // NOTE: no early Mahalanobis gating here; we will gate vs refined centres later.
+                    Row {
+                        idx: j,
+                        id,
+                        raw,
+                        labs,
+                        post,
+                        means: model.means.clone(),
+                        vars: model.vars.clone(),
+                    }
+                })
+                .collect()
+        };
 
-                Row {
-                    id,
-                    raw,
-                    labs,
-                    post,
-                    means: model.means.clone(),
-                    vars:  model.vars.clone(),
-                }
-            })
-            .collect();
-
+        // ---- 2) Auto τ once (cheap; measure)
         if tau_opt.is_none() {
+            let _s = prof.scope("auto_tau");
             let mut ps = Vec::new();
             for r in &rows {
                 for (si, &p) in r.post.iter().enumerate() {
@@ -474,141 +571,156 @@ pub fn run_from_pairs(
         }
         let tau = tau_opt.unwrap();
 
-        // per-SNP nocall@τ counter for bad-SNP learning
+        // per-SNP nocall@τ counter
         let mut nocall_tau_per_snp: HashMap<u32, u64> = HashMap::new();
 
-        for r in rows {
-            let mut out = Vec::with_capacity(1 + s);
-            out.push(r.id.to_string());
+        // ---- 3) Finalize calls + write rows
+        {
+            // Use manual span to allow nested scopes inside.
+            let idx_finalize = prof.start("chunk_finalize_and_write");
 
-            // Robust genotype-name mapping (based on EM means just to map indices)
-            let names: Vec<&'static str> = map_labels_for_snp_strict(&r.means, cfg.feature_space.w_theta);
+            for r in rows {
+                let mut out = Vec::with_capacity(1 + s);
+                out.push(r.id.to_string());
 
-            let mut this_snp_nocall_tau: u64 = 0;
+                let names: Vec<&'static str> =
+                    map_labels_for_snp_strict(&r.means, cfg.feature_space.w_theta);
 
-            // Precompute features for geometry/maha
-            let mut pts_cache: Vec<(f64, f64)> = Vec::with_capacity(s);
-            for si in 0..s {
-                let p = *samples[si].pos.get(&r.id).unwrap();
-                let red = samples[si].x_red[p] as f64;
-                let grn = samples[si].y_grn[p] as f64;
-                let lnr = (red + 1.0).ln();
-                let lng = (grn + 1.0).ln();
-                pts_cache.push(to_features_from_logs(&cfg.feature_space, lnr, lng));
-            }
+                let mut this_snp_nocall_tau: u64 = 0;
 
-            // ----- Compute refined centres from confident points (posterior >= tau)
-            let mut refined = r.means.clone();
-            if !r.means.is_empty() {
-                let k = r.means.len();
-                let mut acc = vec![(0.0f64, 0.0f64, 0.0f64); k]; // sumx,sumy,sumw
+                // Precompute features for geometry/maha
+                let mut pts_cache: Vec<(f64, f64)> = Vec::with_capacity(s);
+                for si in 0..s {
+                    let p = pos_index[si][r.idx];
+                    let red = samples[si].x_red[p] as f64;
+                    let grn = samples[si].y_grn[p] as f64;
+                    let lnr = (red + 1.0).ln();
+                    let lng = (grn + 1.0).ln();
+                    pts_cache.push(to_features_from_logs(&cfg.feature_space, lnr, lng));
+                }
+
+                // Refined centres
+                let mut refined = r.means.clone();
+                if !r.means.is_empty() {
+                    let k = r.means.len();
+                    let mut acc = vec![(0.0f64, 0.0f64, 0.0f64); k]; // sumx,sumy,sumw
+                    for si in 0..s {
+                        if r.post[si] >= tau {
+                            let j = safe_lab_index(r.id, r.labs[si], k);
+                            let (x, y) = pts_cache[si];
+                            let w = r.post[si];
+                            acc[j].0 += x * w;
+                            acc[j].1 += y * w;
+                            acc[j].2 += w;
+                        }
+                    }
+                    for j in 0..k {
+                        if acc[j].2 > 1e-6 {
+                            refined[j].0 = acc[j].0 / acc[j].2;
+                            refined[j].1 = acc[j].1 / acc[j].2;
+                        }
+                    }
+                }
+
+                // Mahalanobis gate vs refined centres
+                let mut m_gate_refined = vec![false; s];
                 for si in 0..s {
                     if r.post[si] >= tau {
-                        let j = safe_lab_index(r.id, r.labs[si], k);
-                        let (x, y) = pts_cache[si];
-                        let w = r.post[si];
-                        acc[j].0 += x * w;
-                        acc[j].1 += y * w;
-                        acc[j].2 += w;
+                        let j = safe_lab_index(r.id, r.labs[si], refined.len());
+                        let m2r = maha2_diag(pts_cache[si], refined[j], r.vars[j]);
+                        if m2r.sqrt() > cfg.max_maha {
+                            m_gate_refined[si] = true;
+                        }
                     }
                 }
-                for j in 0..k {
-                    if acc[j].2 > 1e-6 {
-                        refined[j].0 = acc[j].0 / acc[j].2;
-                        refined[j].1 = acc[j].1 / acc[j].2;
-                    }
-                }
-            }
 
-            // ----- Mahalanobis gate vs refined centres (reuse EM variances)
-            let mut m_gate_refined = vec![false; s];
-            for si in 0..s {
-                if r.post[si] >= tau {
-                    let j = safe_lab_index(r.id, r.labs[si], refined.len());
-                    let m2r = maha2_diag(pts_cache[si], refined[j], r.vars[j]);
-                    if m2r.sqrt() > cfg.max_maha {
-                        m_gate_refined[si] = true;
-                    }
-                }
-            }
+                // Write calls & update stats/feedback
+                for si in 0..s {
+                    let st = &mut stats[si];
+                    st.total += 1;
 
-            // ----- Write calls & update stats/feedback
-            for si in 0..s {
-                let st = &mut stats[si];
-                st.total += 1;
-
-                if r.raw[si] < r_min {
-                    st.nocall_raw += 1;
-                    out.push("NoCall".into());
-                    let e = fb.entry(r.id).or_default();
-                    e.seen += 1;
-                    e.nocall_raw += 1;
-                    continue;
-                }
-
-                st.pass_raw += 1;
-
-                if r.post[si] >= 0.90 {
-                    st.calls_p090 += 1;
-                }
-
-                // refined-centre Mahalanobis gate first
-                if m_gate_refined[si] {
-                    st.nocall_p += 1;
-                    st.nocall_maha += 1;
-                    out.push("NoCall".into());
-                    this_snp_nocall_tau += 1;
-                    let e = fb.entry(r.id).or_default();
-                    e.seen += 1;
-                    e.nocall_p += 1;
-                    continue;
-                }
-
-                if r.post[si] < tau {
-                    st.nocall_p += 1;
-                    out.push("NoCall".into());
-                    this_snp_nocall_tau += 1;
-                    let e = fb.entry(r.id).or_default();
-                    e.seen += 1;
-                    e.nocall_p += 1;
-                } else {
-                    let jlab0 = safe_lab_index(r.id, r.labs[si], r.means.len());
-                    let call = names[jlab0];
-                    let strong = 0.97;
-                    let band   = 0.04;
-
-                    let theta_sample = pts_cache[si].0 / cfg.feature_space.w_theta.max(1e-9);
-                    let ok = r.post[si] >= strong
-                        || theta_guard_ok(&refined, cfg.feature_space.w_theta, call, theta_sample, band);
-
-                    if ok {
-                        st.calls_tau += 1;
-                        out.push(call.into());
+                    if r.raw[si] < r_min {
+                        st.nocall_raw += 1;
+                        out.push("NoCall".into());
                         let e = fb.entry(r.id).or_default();
                         e.seen += 1;
-                    } else {
-                        st.nocall_p += 1; // demoted by geometry guard
+                        e.nocall_raw += 1;
+                        continue;
+                    }
+
+                    st.pass_raw += 1;
+                    if r.post[si] >= 0.90 {
+                        st.calls_p090 += 1;
+                    }
+
+                    if m_gate_refined[si] {
+                        st.nocall_p += 1;
+                        st.nocall_maha += 1;
                         out.push("NoCall".into());
                         this_snp_nocall_tau += 1;
                         let e = fb.entry(r.id).or_default();
                         e.seen += 1;
                         e.nocall_p += 1;
+                        continue;
+                    }
+
+                    if r.post[si] < tau {
+                        st.nocall_p += 1;
+                        out.push("NoCall".into());
+                        this_snp_nocall_tau += 1;
+                        let e = fb.entry(r.id).or_default();
+                        e.seen += 1;
+                        e.nocall_p += 1;
+                    } else {
+                        let jlab0 = safe_lab_index(r.id, r.labs[si], r.means.len());
+                        let call = names[jlab0];
+                        let strong = 0.97;
+                        let band = 0.04;
+
+                        let theta_sample =
+                            pts_cache[si].0 / cfg.feature_space.w_theta.max(1e-9);
+                        let ok = r.post[si] >= strong
+                            || theta_guard_ok(
+                                &refined,
+                                cfg.feature_space.w_theta,
+                                call,
+                                theta_sample,
+                                band,
+                            );
+
+                        if ok {
+                            st.calls_tau += 1;
+                            out.push(call.into());
+                            let e = fb.entry(r.id).or_default();
+                            e.seen += 1;
+                        } else {
+                            st.nocall_p += 1;
+                            out.push("NoCall".into());
+                            this_snp_nocall_tau += 1;
+                            let e = fb.entry(r.id).or_default();
+                            e.seen += 1;
+                            e.nocall_p += 1;
+                        }
                     }
                 }
-            }
 
-            // learn bad SNPs by NoCall@τ rate
-            nocall_tau_per_snp.insert(r.id, this_snp_nocall_tau);
+                // learn bad SNPs
+                nocall_tau_per_snp.insert(r.id, this_snp_nocall_tau);
 
-            w.write_record(out).map_err(|e| e.to_string())?;
+                // append row (only if enabled)
+                if let Some(w) = w_opt.as_mut() {
+                    w.write_record(&out).map_err(|e| e.to_string())?;
+                }
 
-            // ----- Plots + Debug -----
-            let is_debug_this = cfg.debug_snp.map(|ds| ds == r.id).unwrap_or(false);
-            if (cfg.plot_first_snps > 0 && plots_emitted < cfg.plot_first_snps) || is_debug_this {
+                // ----- Plots + Debug -----
+                let is_debug_this = cfg.debug_snp.map(|ds| ds == r.id).unwrap_or(false);
+                let do_plot = (cfg.plot_first_snps > 0 && plots_emitted < cfg.plot_first_snps)
+                    || is_debug_this;
+
                 // recompute feature points for this SNP (same as clustering pass)
                 let mut pts = Vec::with_capacity(s);
                 for si in 0..s {
-                    let p = *samples[si].pos.get(&r.id).unwrap();
+                    let p = pos_index[si][r.idx];
                     let red = samples[si].x_red[p] as f64;
                     let grn = samples[si].y_grn[p] as f64;
                     let lnr = (red + 1.0).ln();
@@ -630,72 +742,79 @@ pub fn run_from_pairs(
                         let jlab0 = safe_lab_index(r.id, r.labs[si], r.means.len());
                         let call = names[jlab0];
                         let strong = 0.97;
-                        let band   = 0.04;
-                        let theta_sample = pts[si].0 / cfg.feature_space.w_theta.max(1e-9);
+                        let band = 0.04;
+                        let theta_sample =
+                            pts[si].0 / cfg.feature_space.w_theta.max(1e-9);
                         if r.post[si] >= strong
-                            || theta_guard_ok(&refined, cfg.feature_space.w_theta, call, theta_sample, band)
-                        {
+                            || theta_guard_ok(
+                                &refined,
+                                cfg.feature_space.w_theta,
+                                call,
+                                theta_sample,
+                                band,
+                            ) {
                             call.to_string()
                         } else {
                             "NoCall".to_string()
                         }
                     };
-
                     final_calls.push(c);
                     maha_flags.push(m_gate_refined[si]); // use refined gate flags in plot
                 }
 
-                // Debug CSV if requested
-                if is_debug_this {
-                    let _ = write_debug_csv_for_snp(
-                        out_dir,
-                        r.id,
-                        &pts,
-                        &r.labs,
-                        &r.post,
-                        &m_gate_refined,          // refined gate flags
-                        &r.raw,
-                        &final_calls,
-                        &r.means,
-                        Some(&refined),
-                        tau,
-                        r_min,
-                    );
+                // 1) Plot (own scope)
+                if do_plot {
+                    {
+                        let _s_plot = prof.scope("plot_one_snp");
+                        let plot_path_base = plots_dir.join(format!("snp_{:08}", r.id));
+                        let _ = write_cluster_scatter_png_calls(
+                            &plot_path_base,
+                            r.id,
+                            &feature_label,
+                            &pts,
+                            &final_calls,
+                            &maha_flags,
+                            &r.means,
+                            Some(&refined),
+                        );
+                    }
+                    if cfg.plot_first_snps > 0 && plots_emitted < cfg.plot_first_snps {
+                        plots_emitted += 1;
+                    }
                 }
 
-                // Plot (centres prefer refined)
-                if cfg.plot_first_snps > 0 && plots_emitted < cfg.plot_first_snps {
-                    let plot_path_base = plots_dir.join(format!("snp_{:08}", r.id));
-                    let _ = write_cluster_scatter_png_calls(
-                        &plot_path_base,
-                        r.id,
-                        &feature_label,
-                        &pts,
-                        &final_calls,
-                        &maha_flags,
-                        &r.means,
-                        Some(&refined),
-                    );
-                    plots_emitted += 1;
-                } else if is_debug_this {
-                    let plot_path_base = plots_dir.join(format!("snp_{:08}", r.id));
-                    let _ = write_cluster_scatter_png_calls(
-                        &plot_path_base,
-                        r.id,
-                        &feature_label,
-                        &pts,
-                        &final_calls,
-                        &maha_flags,
-                        &r.means,
-                        Some(&refined),
-                    );
+                // 2) Debug CSV (separate scope, after plot scope ends)
+                if is_debug_this {
+                    {
+                        let _s_dbg = prof.scope("debug_csv_one_snp");
+                        let _ = write_debug_csv_for_snp(
+                            out_dir,
+                            r.id,
+                            &pts,
+                            &r.labs,
+                            &r.post,
+                            &m_gate_refined, // refined gate flags
+                            &r.raw,
+                            &final_calls,
+                            &r.means,
+                            Some(&refined),
+                            tau,
+                            r_min,
+                        );
+                    }
                 }
             }
-        }
-        w.flush().map_err(|e| e.to_string())?;
+            if let Some(w) = w_opt.as_mut() {
+                w.flush().map_err(|e| e.to_string())?;
+            }
 
-        // After chunk: update bad SNPs set based on NoCall@τ rate
+            // Close the manual span
+            prof.end(idx_finalize);
+        }
+
+        // After chunk: update bad SNPs set
         if cfg.nocall_bad_thresh > 0.0 {
+            let _s = prof.scope("update_bad_snps_after_chunk");
             for (id, n_no) in nocall_tau_per_snp {
                 let rate = (n_no as f64) / (s as f64);
                 if rate >= cfg.nocall_bad_thresh {
@@ -708,51 +827,64 @@ pub fn run_from_pairs(
     }
 
     // QC summary
-    let mut qcw = Writer::from_path(&qc_path).map_err(|e| e.to_string())?;
-    qcw.write_record(&[
-        "Sample",
-        "total_snps",
-        "pass_raw",
-        "nocall_raw",
-        "nocall_p_at_tau",
-        "nocall_maha_at_tau",
-        "calls_at_tau",
-        "calls_at_p090",
-        "call_rate_tau",
-        "call_rate_p090",
-        "r_min_used",
-        "tau_used",
-    ])
-    .map_err(|e| e.to_string())?;
-    let tau_report = tau_opt.unwrap_or(0.90);
-    for (i, st) in stats.iter().enumerate() {
-        let name = &samples[i].name;
-        let rate_tau = (st.calls_tau as f64) / (st.total as f64);
-        let rate_p = (st.calls_p090 as f64) / (st.total as f64);
+    {
+        let _s = prof.scope("write_qc_summary");
+        let mut qcw = Writer::from_path(&qc_path).map_err(|e| e.to_string())?;
         qcw.write_record(&[
-            name.to_string(),
-            st.total.to_string(),
-            st.pass_raw.to_string(),
-            st.nocall_raw.to_string(),
-            st.nocall_p.to_string(),
-            st.nocall_maha.to_string(),
-            st.calls_tau.to_string(),
-            st.calls_p090.to_string(),
-            format!("{:.6}", rate_tau),
-            format!("{:.6}", rate_p),
-            r_min.to_string(),
-            format!("{:.4}", tau_report),
+            "Sample",
+            "total_snps",
+            "pass_raw",
+            "nocall_raw",
+            "nocall_p_at_tau",
+            "nocall_maha_at_tau",
+            "calls_at_tau",
+            "calls_at_p090",
+            "call_rate_tau",
+            "call_rate_p090",
+            "r_min_used",
+            "tau_used",
         ])
         .map_err(|e| e.to_string())?;
+        let tau_report = tau_opt.unwrap_or(0.90);
+        for (i, st) in stats.iter().enumerate() {
+            let name = &samples[i].name;
+            let rate_tau = (st.calls_tau as f64) / (st.total as f64);
+            let rate_p = (st.calls_p090 as f64) / (st.total as f64);
+            qcw.write_record(&[
+                name.to_string(),
+                st.total.to_string(),
+                st.pass_raw.to_string(),
+                st.nocall_raw.to_string(),
+                st.nocall_p.to_string(),
+                st.nocall_maha.to_string(),
+                st.calls_tau.to_string(),
+                st.calls_p090.to_string(),
+                format!("{:.6}", rate_tau),
+                format!("{:.6}", rate_p),
+                r_min.to_string(),
+                format!("{:.4}", tau_report),
+            ])
+            .map_err(|e| e.to_string())?;
+        }
+        qcw.flush().map_err(|e| e.to_string())?;
     }
-    qcw.flush().map_err(|e| e.to_string())?;
 
     // Save learning state
-    if let Some(ref p) = cfg.feedback_out {
-        let _ = adaptive::save_feedback(p, &fb);
+    {
+        let _s = prof.scope("save_learning_state");
+        if let Some(ref p) = cfg.feedback_out {
+            let _ = adaptive::save_feedback(p, &fb);
+        }
+        if let Some(ref p) = cfg.bad_snps_out {
+            let _ = adaptive::save_bad_snps(p, &bad);
+        }
     }
-    if let Some(ref p) = cfg.bad_snps_out {
-        let _ = adaptive::save_bad_snps(p, &bad);
+
+    // Persist timings
+    {
+        let idx = prof.start("write_timings_csv");
+        let _ = prof.write_csv(out_dir);
+        prof.end(idx);
     }
 
     Ok((calls_path, qc_path))
@@ -868,37 +1000,44 @@ fn write_cluster_scatter_png_calls(
     let lbl_bb = format!("BB (n={})", n_bb);
 
     // Draw helper: solid = pass; hollow = Mahalanobis-gated but still passed τ
-    let mut draw_group = |label: &str, idxs: &[usize], color: RGBColor| -> Result<(), String> {
-        chart
-            .draw_series(
-                idxs.iter()
-                    .filter(|&&i| !maha_flags[i])
-                    .map(|&i| {
-                        let (x, y) = pts[i];
-                        Circle::new((x, y), 3, color.filled())
-                    }),
-            )
-            .map_err(|e| e.to_string())?
-            .label(label.to_string())
-            .legend(move |(x, y)| Circle::new((x, y), 5, color.filled()));
+    let mut draw_group =
+        |label: &str, idxs: &[usize], color: RGBColor| -> Result<(), String> {
+            chart
+                .draw_series(
+                    idxs.iter()
+                        .filter(|&&i| !maha_flags[i])
+                        .map(|&i| {
+                            let (x, y) = pts[i];
+                            Circle::new((x, y), 3, color.filled())
+                        }),
+                )
+                .map_err(|e| e.to_string())?
+                .label(label.to_string())
+                .legend(move |(x, y)| Circle::new((x, y), 5, color.filled()));
 
-        chart
-            .draw_series(
-                idxs.iter()
-                    .filter(|&&i| maha_flags[i])
-                    .map(|&i| {
-                        let (x, y) = pts[i];
-                        Circle::new((x, y), 4, color.stroke_width(1))
-                    }),
-            )
-            .map_err(|e| e.to_string())?;
+            chart
+                .draw_series(
+                    idxs.iter()
+                        .filter(|&&i| maha_flags[i])
+                        .map(|&i| {
+                            let (x, y) = pts[i];
+                            Circle::new((x, y), 4, color.stroke_width(1))
+                        }),
+                )
+                .map_err(|e| e.to_string())?;
 
-        Ok(())
-    };
+            Ok(())
+        };
 
-    if !idx_aa.is_empty() { draw_group(&lbl_aa, &idx_aa, RED)?; }
-    if !idx_ab.is_empty() { draw_group(&lbl_ab, &idx_ab, BLUE)?; }
-    if !idx_bb.is_empty() { draw_group(&lbl_bb, &idx_bb, GREEN)?; }
+    if !idx_aa.is_empty() {
+        draw_group(&lbl_aa, &idx_aa, RED)?;
+    }
+    if !idx_ab.is_empty() {
+        draw_group(&lbl_ab, &idx_ab, BLUE)?;
+    }
+    if !idx_bb.is_empty() {
+        draw_group(&lbl_bb, &idx_bb, GREEN)?;
+    }
 
     // Draw chosen centres as black crosses
     chart
@@ -971,24 +1110,16 @@ fn write_debug_csv_for_snp(
     w.write_record(&["MEAN_IDX", "theta", "r"])
         .map_err(|e| e.to_string())?;
     for (j, m) in means.iter().enumerate() {
-        w.write_record(&[
-            j.to_string(),
-            format!("{:.6}", m.0),
-            format!("{:.6}", m.1),
-        ])
-        .map_err(|e| e.to_string())?;
+        w.write_record(&[j.to_string(), format!("{:.6}", m.0), format!("{:.6}", m.1)])
+            .map_err(|e| e.to_string())?;
     }
     // refined means
     if let Some(rm) = refined_means {
         w.write_record(&["REFINED_MEAN_IDX", "theta", "r"])
             .map_err(|e| e.to_string())?;
         for (j, m) in rm.iter().enumerate() {
-            w.write_record(&[
-                j.to_string(),
-                format!("{:.6}", m.0),
-                format!("{:.6}", m.1),
-            ])
-            .map_err(|e| e.to_string())?;
+            w.write_record(&[j.to_string(), format!("{:.6}", m.0), format!("{:.6}", m.1)])
+                .map_err(|e| e.to_string())?;
         }
     }
     w.flush().map_err(|e| e.to_string())?;

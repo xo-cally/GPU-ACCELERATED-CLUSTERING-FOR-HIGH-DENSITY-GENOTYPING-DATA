@@ -5,3 +5,4 @@ pub mod model;
 pub mod cohort;
 pub mod preflight; 
 pub mod adaptive;
+pub mod profiler; 
