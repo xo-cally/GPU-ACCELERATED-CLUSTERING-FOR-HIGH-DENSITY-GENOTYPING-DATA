@@ -1,6 +1,51 @@
 use rand::{rngs::StdRng, Rng, SeedableRng};
 use std::cmp::Ordering;
 
+#[cfg(feature = "gpu")]
+use crate::gpu;
+
+#[cfg(feature = "gpu")]
+pub struct BatchEmOut {
+    pub w: Vec<f32>,   // len = B*K
+    pub mx: Vec<f32>,  // len = B*K
+    pub my: Vec<f32>,  // len = B*K
+    pub vx: Vec<f32>,  // len = B*K
+    pub vy: Vec<f32>,  // len = B*K
+    pub ll: Vec<f32>,  // len = B
+}
+
+#[cfg(feature = "gpu")]
+pub fn gpu_em_one_iter_batched_k(
+    xs: &[f32], ys: &[f32], s: usize, b: usize, k: usize,
+    w: &[f32], mx: &[f32], my: &[f32], vx: &[f32], vy: &[f32],
+) -> Option<BatchEmOut> {
+    use crate::gpu::em_one_iter_k_batched;
+    let (w2, mx2, my2, vx2, vy2, ll) = em_one_iter_k_batched(xs, ys, s, b, k, w, mx, my, vx, vy)?;
+    Some(BatchEmOut { w: w2, mx: mx2, my: my2, vx: vx2, vy: vy2, ll })
+}
+
+#[cfg(feature = "gpu")]
+pub fn gpu_bic_batched(s: usize, b: usize, k: usize, ll: &[f32]) -> Option<Vec<f32>> {
+    crate::gpu::bic_batched_gpu(s, b, k, ll)
+}
+
+// ---- GPU debug/knobs ----
+#[inline]
+fn gpu_debug() -> bool {
+    std::env::var("GPU_DEBUG").as_deref() == Ok("1")
+}
+#[inline]
+fn gpu_min_n() -> usize {
+    std::env::var("GPU_MIN_N")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(4096)
+}
+#[inline]
+fn gpu_force() -> bool {
+    std::env::var("GPU_FORCE").as_deref() == Ok("1")
+}
+
 // ---- Feature space (ThetaR only) ----
 #[derive(Debug, Clone, Copy)]
 pub struct ThetaR {
@@ -13,10 +58,8 @@ pub fn ln1p_u16(v: u16) -> f64 { (v as f64 + 1.0).ln() }
 
 #[inline]
 pub fn to_features_from_logs(fs: &ThetaR, lnr: f64, lng: f64) -> (f64, f64) {
-    // theta in [0,1], r = ln(R+G+1)
     let r = lnr.exp() - 1.0;
     let g = lng.exp() - 1.0;
-    // Rescale theta to [0,1] in the positive quadrant
     let theta = (2.0 * g.atan2(r)) / std::f64::consts::PI;
     let rr = (r + g + 1.0).ln();
     (theta * fs.w_theta, rr * fs.w_r)
@@ -33,8 +76,7 @@ fn lse(xs: &[f64]) -> f64 {
 #[inline]
 fn nlogpdf_diag(x: (f64, f64), mu: (f64, f64), var: (f64, f64)) -> f64 {
     let (vx, vy) = (var.0.max(1e-8), var.1.max(1e-8));
-    let dx = x.0 - mu.0;
-    let dy = x.1 - mu.1;
+    let dx = x.0 - mu.0; let dy = x.1 - mu.1;
     -0.5 * (dx * dx / vx + dy * dy / vy)
         - 0.5 * ((vx * vy).ln() + 2.0 * std::f64::consts::PI.ln())
 }
@@ -78,7 +120,6 @@ fn kpp(points: &[(f64, f64)], k: usize, seed: u64) -> Vec<(f64, f64)> {
 
 pub fn fit_diag(points: &[(f64, f64)], k: usize, max_iter: usize, tol: f64, seed: u64) -> GmmDiag {
     let n = points.len().max(1);
-
     let mut weights = vec![1.0 / k as f64; k];
     let mut means = kpp(points, k, seed);
 
@@ -96,7 +137,45 @@ pub fn fit_diag(points: &[(f64, f64)], k: usize, max_iter: usize, tol: f64, seed
     let mut logs = vec![0.0; k];
 
     for _ in 0..max_iter {
-        // E-step accumulators
+        // ---------- GPU fast path (optional) ----------
+        #[cfg(feature = "gpu")]
+        {
+            let min_n = gpu_min_n();
+            let force = gpu_force();
+            let use_gpu = std::env::var("USE_GPU").as_deref() != Ok("0");
+            let ok = (k <= 3) && (points.len() >= min_n || force) && use_gpu;
+            if ok {
+                if gpu_debug() {
+                    eprintln!("[GPU] trying GPU E-step (N={}, K={}, min_n={}, force={})",
+                              points.len(), k, min_n, force);
+                }
+                if let Some((w2, m2, v2, ll2)) = gpu::em_one_iter_k3(points, &weights, &means, &vars) {
+                    let mut moved = 0.0;
+                    for j in 0..k {
+                        moved += ((means[j].0 - m2[j].0).powi(2)
+                                + (means[j].1 - m2[j].1).powi(2)).sqrt();
+                    }
+                    weights = w2; means = m2; vars = v2;
+                    if gpu_debug() {
+                        eprintln!("[GPU] E-step on GPU succeeded; ll={:.6}, moved_avg={:.3e}",
+                                  ll2, moved / (k as f64));
+                    }
+                    if (ll2 - loglik).abs() <= tol { loglik = ll2; break; }
+                    loglik = ll2;
+                    if moved / (k as f64) < tol { break; }
+                    continue; // next EM iteration
+                } else if gpu_debug() {
+                    eprintln!("[GPU] GPU path unavailable -> CPU fallback");
+                }
+            } else if gpu_debug() {
+                let reason = if k > 3 { "K>3" }
+                    else if !use_gpu { "USE_GPU=0" }
+                    else if points.len() < min_n && !force { "N<GPU_MIN_N" }
+                    else { "unknown" };
+                eprintln!("[GPU] skipping GPU E-step: {}", reason);
+            }
+        }
+        // ---------- CPU E-step ----------
         let (mut nk, mut sx, mut sy, mut sxx, mut syy) =
             (vec![0.0; k], vec![0.0; k], vec![0.0; k], vec![0.0; k], vec![0.0; k]);
         let mut ll = 0.0;
@@ -111,6 +190,7 @@ pub fn fit_diag(points: &[(f64, f64)], k: usize, max_iter: usize, tol: f64, seed
             }
         }
 
+        // M-step
         let mut moved = 0.0;
         for j in 0..k {
             let nkj = nk[j].max(1e-8);
@@ -146,7 +226,23 @@ pub fn fit_diag_restarts(points: &[(f64, f64)], k: usize, max_iter: usize, tol: 
 }
 
 pub fn bic(m: &GmmDiag, n: usize) -> f64 {
-    let p = (m.k as f64 - 1.0) + 4.0 * m.k as f64; // weights + means/vars
+    let k = m.k;
+
+    // Try GPU BIC first (if compiled & enabled). Falls back to CPU formula.
+    #[cfg(feature = "gpu")]
+    {
+        if std::env::var("USE_GPU").as_deref() != Ok("0") {
+            if let Some(b) = gpu::bic_gpu(n, k, m.loglik) {
+                if gpu_debug() {
+                    eprintln!("[GPU] BIC via GPU: n={}, k={}, ll={:.6} -> {:.6}", n, k, m.loglik, b);
+                }
+                return b;
+            }
+        }
+    }
+
+    // CPU fallback
+    let p = (k as f64 - 1.0) + 4.0 * k as f64; // weights + means/vars
     -2.0 * m.loglik + p * (n as f64).ln()
 }
 
@@ -173,13 +269,11 @@ pub fn maha2_diag(p: (f64, f64), mu: (f64, f64), var: (f64, f64)) -> f64 {
 }
 
 // ---- r_min auto & FDR-style tau ----
-// z must be ln(R+G+1) per SNP for one sample.
 pub fn rmin_from_lnxy_sum(z: &[f64]) -> u32 {
     #[derive(Clone, Copy, Debug)]
     struct G1 { w0:f64, mu0:f64, s0:f64, w1:f64, mu1:f64, s1:f64 }
 
     fn em(z: &[f64]) -> G1 {
-        use std::cmp::Ordering;
         let n = z.len().max(1);
         let mut v = z.to_vec();
         v.sort_by(|a, b| a.partial_cmp(b).unwrap_or(Ordering::Equal));
@@ -201,7 +295,7 @@ pub fn rmin_from_lnxy_sum(z: &[f64]) -> u32 {
                 ll += den.ln();
                 r0s += r0; r1s += r1; r0t += r0 * t; r1t += r1 * t; r0tt += r0 * t * t; r1tt += r1 * t * t;
             }
-            w0 = (r0s / (n as f64)).clamp(1e-6, 1.0 - 1e-6); w1 = 1.0 - w0;
+            w0 = (r0s / (n as f64)).clamp(1e-6, 1.0 - 1.0e-6); w1 = 1.0 - w0;
             mu0 = r0t / (r0s.max(1e-8)); mu1 = r1t / (r1s.max(1e-8));
             let v0 = (r0tt / (r0s.max(1e-8)) - mu0 * mu0).max(1e-6);
             let v1 = (r1tt / (r1s.max(1e-8)) - mu1 * mu1).max(1e-6);

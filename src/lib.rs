@@ -3,6 +3,9 @@ pub mod idat;
 pub mod pairs;
 pub mod model;
 pub mod cohort;
-pub mod preflight; 
+pub mod preflight;
 pub mod adaptive;
-pub mod profiler; 
+pub mod profiler;
+
+#[cfg(feature = "gpu")]
+pub mod gpu; 

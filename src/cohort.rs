@@ -141,7 +141,7 @@ fn build_positions_for_ids(samples: &[SampleData], ids: &[u32]) -> Vec<Vec<usize
         .collect()
 }
 
-// =============== K=1 baseline & choose_k ===============
+// =============== K=1 baseline & choose_k (CPU fallback) ===============
 fn fit_k1(points: &[(f64, f64)]) -> GmmDiag {
     let n = points.len().max(1);
     let (mut mx, mut my) = (0.0, 0.0);
@@ -289,7 +289,26 @@ fn theta_guard_ok(
     }
 }
 
-// =============== Main cohort runner (no normalization) ===============
+// ---- small helpers for GPU path ----
+#[inline]
+fn use_gpu_runtime() -> bool {
+    std::env::var("USE_GPU").as_deref() != Ok("0")
+}
+
+#[cfg(feature = "gpu")]
+fn gpu_debug() -> bool {
+    std::env::var("GPU_DEBUG").as_deref() == Ok("1")
+}
+
+#[cfg(feature = "gpu")]
+fn gpu_min_n() -> usize {
+    std::env::var("GPU_MIN_N")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(4096)
+}
+
+// ======== Main cohort runner (no normalization) ========
 pub fn run_from_pairs(
     pairs: &[(PathBuf, PathBuf)],
     out_dir: &Path,
@@ -452,6 +471,8 @@ pub fn run_from_pairs(
 
     for chunk_start in (0..m).step_by(block) {
         let end = (chunk_start + block).min(m);
+        let b = end - chunk_start; // SNPs in this chunk
+        let s_samples = s;
 
         #[derive(Clone)]
         struct Row {
@@ -464,39 +485,429 @@ pub fn run_from_pairs(
             vars: Vec<(f64, f64)>,
         }
 
-        // ---- 1) Cluster chunk in parallel
-        let rows: Vec<Row> = {
+        // ==================== GPU fast path (batched) ====================
+        let try_gpu = {
+            #[cfg(feature = "gpu")]
+            {
+                use_gpu_runtime() && cfg.k_max <= 3 && s_samples >= gpu_min_n()
+            }
+            #[cfg(not(feature = "gpu"))]
+            {
+                false
+            }
+        };
+
+        let rows: Vec<Row> = if try_gpu {
+            // --------------- Build SoA batch (xs,ys), raw sums, cache pts ---------------
+            let _s = prof.scope("chunk_cluster_em_bic");
+            let mut xs: Vec<f32> = Vec::with_capacity(b * s_samples);
+            let mut ys: Vec<f32> = Vec::with_capacity(b * s_samples);
+            let mut raw_sums: Vec<Vec<u32>> = vec![vec![0u32; s_samples]; b];
+            let mut pts_batch: Vec<Vec<(f64, f64)>> = vec![Vec::with_capacity(s_samples); b];
+
+            for (bj, j) in (chunk_start..end).enumerate() {
+                for si in 0..s_samples {
+                    let p = pos_index[si][j];
+                    let red = samples[si].x_red[p] as f64;
+                    let grn = samples[si].y_grn[p] as f64;
+                    let lnr = (red + 1.0).ln();
+                    let lng = (grn + 1.0).ln();
+                    let (th, rr) = to_features_from_logs(&cfg.feature_space, lnr, lng);
+                    xs.push(th as f32);
+                    ys.push(rr as f32);
+                    raw_sums[bj][si] =
+                        (samples[si].x_red[p] as u32) + (samples[si].y_grn[p] as u32);
+                    pts_batch[bj].push((th, rr));
+                }
+            }
+
+            // --------------- Initial params per K (simple quantile seeding) ---------------
+            #[inline]
+            fn init_for_k(
+                pts: &[(f64, f64)],
+                k: usize,
+            ) -> (Vec<f32>, Vec<f32>, Vec<f32>, Vec<f32>, Vec<f32>) {
+                let n = pts.len().max(1);
+                let mut mx = 0.0;
+                let mut my = 0.0;
+                for &(x, y) in pts {
+                    mx += x;
+                    my += y;
+                }
+                mx /= n as f64;
+                my /= n as f64;
+                let mut vx = 0.0;
+                let mut vy = 0.0;
+                for &(x, y) in pts {
+                    vx += (x - mx) * (x - mx);
+                    vy += (y - my) * (y - my);
+                }
+                vx = (vx / n as f64).max(1e-2);
+                vy = (vy / n as f64).max(1e-2);
+
+                let mut idx: Vec<usize> = (0..n).collect();
+                idx.sort_by(|&a, &b| pts[a].0.partial_cmp(&pts[b].0).unwrap()); // sort by theta
+
+                let mut pick = Vec::with_capacity(k);
+                for t in 1..=k {
+                    let pos =
+                        ((t as f64) / ((k + 1) as f64) * (n as f64)).floor() as usize;
+                    pick.push(idx[pos.min(n - 1)]);
+                }
+
+                let w = vec![1.0f32 / k as f32; k];
+                let mut mxs = vec![0.0f32; k];
+                let mut mys = vec![0.0f32; k];
+                let vxs = vec![vx as f32; k];
+                let vys = vec![vy as f32; k];
+                for (j, &pi) in pick.iter().enumerate() {
+                    mxs[j] = pts[pi].0 as f32;
+                    mys[j] = pts[pi].1 as f32;
+                }
+                (w, mxs, mys, vxs, vys)
+            }
+
+            #[cfg(feature = "gpu")]
+            use crate::model::{gpu_bic_batched, gpu_em_one_iter_batched_k, BatchEmOut};
+
+            let kmax = cfg.k_max.min(3);
+            struct KF {
+                w: Vec<f32>,
+                mx: Vec<f32>,
+                my: Vec<f32>,
+                vx: Vec<f32>,
+                vy: Vec<f32>,
+                ll: Vec<f32>,
+                bic: Vec<f32>,
+                k: usize,
+            }
+            let mut fits: Vec<KF> = Vec::new();
+
+            for k in 1..=kmax {
+                // concat initial params for the whole batch
+                let mut w0: Vec<f32> = Vec::with_capacity(b * k);
+                let mut mx0: Vec<f32> = Vec::with_capacity(b * k);
+                let mut my0: Vec<f32> = Vec::with_capacity(b * k);
+                let mut vx0: Vec<f32> = Vec::with_capacity(b * k);
+                let mut vy0: Vec<f32> = Vec::with_capacity(b * k);
+
+                for bj in 0..b {
+                    let (w, mx, my, vx, vy) = init_for_k(&pts_batch[bj], k);
+                    w0.extend_from_slice(&w);
+                    mx0.extend_from_slice(&mx);
+                    my0.extend_from_slice(&my);
+                    vx0.extend_from_slice(&vx);
+                    vy0.extend_from_slice(&vy);
+                }
+
+                // EM loop on GPU
+                let mut cur_w = w0;
+                let mut cur_mx = mx0;
+                let mut cur_my = my0;
+                let mut cur_vx = vx0;
+                let mut cur_vy = vy0;
+                let mut last_ll: Option<Vec<f32>> = None;
+
+                for _it in 0..cfg.max_iters {
+                    if let Some(BatchEmOut {
+                        w,
+                        mx,
+                        my,
+                        vx,
+                        vy,
+                        ll,
+                    }) = gpu_em_one_iter_batched_k(
+                        &xs,
+                        &ys,
+                        s_samples,
+                        b,
+                        k,
+                        &cur_w,
+                        &cur_mx,
+                        &cur_my,
+                        &cur_vx,
+                        &cur_vy,
+                    ) {
+                        // check mean improvement over batch
+                        if let Some(prev) = last_ll.as_ref() {
+                            let mut delta = 0.0f64;
+                            for i in 0..b {
+                                delta += (ll[i] as f64 - prev[i] as f64).abs();
+                            }
+                            delta /= b as f64;
+                            if delta <= cfg.tol {
+                                cur_w = w;
+                                cur_mx = mx;
+                                cur_my = my;
+                                cur_vx = vx;
+                                cur_vy = vy;
+                                last_ll = Some(ll);
+                                break;
+                            }
+                        }
+                        cur_w = w;
+                        cur_mx = mx;
+                        cur_my = my;
+                        cur_vx = vx;
+                        cur_vy = vy;
+                        last_ll = Some(ll);
+                    } else {
+                        // GPU failed -> abort GPU path
+                        last_ll = None;
+                        break;
+                    }
+                }
+
+                let Some(ll_vec) = last_ll else {
+                    // abort GPU branch entirely -> fall back to CPU below
+                    fits.clear();
+                    break;
+                };
+
+                // BIC on GPU
+                let bic_vec = gpu_bic_batched(s_samples, b, k, &ll_vec).unwrap_or_else(|| {
+                    // tiny CPU fallback just in case
+                    let p = ((k - 1) + 4 * k) as f32;
+                    ll_vec
+                        .iter()
+                        .map(|&ll| -2.0 * ll + p * (s_samples as f32).ln())
+                        .collect()
+                });
+
+                fits.push(KF {
+                    w: cur_w,
+                    mx: cur_mx,
+                    my: cur_my,
+                    vx: cur_vx,
+                    vy: cur_vy,
+                    ll: ll_vec,
+                    bic: bic_vec,
+                    k,
+                });
+            }
+
+            // If GPU path failed mid-way, drop to CPU path
+            let rows_gpu_or_cpu: Vec<Row> = if fits.is_empty() {
+                if cfg!(feature = "gpu") {
+                    #[cfg(feature = "gpu")]
+                    if gpu_debug() {
+                        eprintln!(
+                            "[GPU] batched path unavailable -> CPU fallback"
+                        );
+                    }
+                }
+                // ==== CPU fallback, identical to the non-GPU branch ====
+                (chunk_start..end)
+                    .into_par_iter()
+                    .map(|j| {
+                        let id = ids[j];
+                        let mut pts = Vec::with_capacity(s_samples);
+                        let mut raw = Vec::with_capacity(s_samples);
+
+                        for si in 0..s_samples {
+                            let p = pos_index[si][j];
+                            let red = samples[si].x_red[p] as f64;
+                            let grn = samples[si].y_grn[p] as f64;
+                            let lnr = (red + 1.0).ln();
+                            let lng = (grn + 1.0).ln();
+                            pts.push(to_features_from_logs(
+                                &cfg.feature_space, lnr, lng,
+                            ));
+                            let rsum = (samples[si].x_red[p] as u32)
+                                + (samples[si].y_grn[p] as u32);
+                            raw.push(rsum);
+                        }
+
+                        let mut model = choose_k(
+                            &pts,
+                            cfg.k_max,
+                            cfg.max_iters,
+                            cfg.tol,
+                            cfg.seed,
+                            cfg.restarts,
+                        );
+
+                        // lightweight heuristics (unchanged)
+                        const GAP3_TO_2: f64 = 0.035;
+                        const GAP2_TO_1: f64 = 0.020;
+                        const MIN_W: f64 = 0.03;
+                        let sorted_thetas =
+                            |means: &[(f64, f64)], w_theta: f64| -> Vec<f64> {
+                                let wth = w_theta.max(1e-9);
+                                let mut t: Vec<f64> =
+                                    means.iter().map(|m| m.0 / wth).collect();
+                                t.sort_by(|a, b| a.partial_cmp(b).unwrap());
+                                t
+                            };
+                        {
+                            let wth = cfg.feature_space.w_theta;
+                            if model.k > 1
+                                && model.weights.iter().any(|&w| w < MIN_W)
+                            {
+                                model = if model.k == 3 {
+                                    fit_diag_restarts(
+                                        &pts,
+                                        2,
+                                        cfg.max_iters,
+                                        cfg.tol,
+                                        cfg.seed,
+                                        cfg.restarts,
+                                    )
+                                } else {
+                                    fit_k1(&pts)
+                                };
+                            }
+                            let t = sorted_thetas(&model.means, wth);
+                            if model.k == 3 {
+                                let min_gap = (t[1] - t[0])
+                                    .abs()
+                                    .min((t[2] - t[1]).abs());
+                                if min_gap < GAP3_TO_2 {
+                                    let m2 = fit_diag_restarts(
+                                        &pts,
+                                        2,
+                                        cfg.max_iters,
+                                        cfg.tol,
+                                        cfg.seed,
+                                        cfg.restarts,
+                                    );
+                                    let t2 = sorted_thetas(&m2.means, wth);
+                                    let gap = (t2[1] - t2[0]).abs();
+                                    model =
+                                        if gap < GAP2_TO_1 { fit_k1(&pts) } else { m2 };
+                                }
+                            } else if model.k == 2 {
+                                let gap = (t[1] - t[0]).abs();
+                                if gap < GAP2_TO_1 {
+                                    model = fit_k1(&pts);
+                                }
+                            }
+                        }
+
+                        let (mut labs, mut post) = (Vec::new(), Vec::new());
+                        predict(&model, &pts, &mut labs, &mut post);
+
+                        Row {
+                            idx: j,
+                            id,
+                            raw,
+                            labs,
+                            post,
+                            means: model.means.clone(),
+                            vars: model.vars.clone(),
+                        }
+                    })
+                    .collect()
+            } else {
+                // ------- choose best K per SNP; compute posteriors/labels on CPU; build rows -------
+                let mut rows_gpu: Vec<Row> = Vec::with_capacity(b);
+
+                for bj in 0..b {
+                    let id = ids[chunk_start + bj];
+
+                    // pick K with min BIC
+                    let mut best_k_idx = 0usize;
+                    let mut best_bic = f32::INFINITY;
+                    for (ki, f) in fits.iter().enumerate() {
+                        let bval = f.bic[bj];
+                        if bval < best_bic {
+                            best_bic = bval;
+                            best_k_idx = ki;
+                        }
+                    }
+                    let fbest = &fits[best_k_idx];
+                    let k = fbest.k;
+
+                    // extract params for SNP bj
+                    let off = bj * k;
+                    let mut weights: Vec<f64> = Vec::with_capacity(k);
+                    let mut means: Vec<(f64, f64)> = Vec::with_capacity(k);
+                    let mut vars: Vec<(f64, f64)> = Vec::with_capacity(k);
+                    for j in 0..k {
+                        weights.push(fbest.w[off + j] as f64);
+                        means.push((
+                            fbest.mx[off + j] as f64,
+                            fbest.my[off + j] as f64,
+                        ));
+                        vars.push((
+                            fbest.vx[off + j] as f64,
+                            fbest.vy[off + j] as f64,
+                        ));
+                    }
+
+                    // compute posteriors/labels per-sample on CPU
+                    let pts = &pts_batch[bj];
+                    let mut labs: Vec<usize> = Vec::new();
+                    let mut post: Vec<f64> = Vec::new();
+                    let model = GmmDiag {
+                        k,
+                        weights: weights.clone(),
+                        means: means.clone(),
+                        vars: vars.clone(),
+                        loglik: 0.0,
+                    };
+                    predict(&model, pts, &mut labs, &mut post);
+
+                    rows_gpu.push(Row {
+                        idx: chunk_start + bj,
+                        id,
+                        raw: raw_sums[bj].clone(),
+                        labs,
+                        post,
+                        means,
+                        vars,
+                    });
+                }
+
+                rows_gpu
+            };
+
+            rows_gpu_or_cpu
+        } else {
+            // ==================== CPU fallback (original) ====================
             let _s = prof.scope("chunk_cluster_em_bic");
             (chunk_start..end)
                 .into_par_iter()
                 .map(|j| {
                     let id = ids[j];
-                    let mut pts = Vec::with_capacity(s);
-                    let mut raw = Vec::with_capacity(s);
+                    let mut pts = Vec::with_capacity(s_samples);
+                    let mut raw = Vec::with_capacity(s_samples);
 
-                    for si in 0..s {
+                    for si in 0..s_samples {
                         let p = pos_index[si][j];
                         let red = samples[si].x_red[p] as f64;
                         let grn = samples[si].y_grn[p] as f64;
                         let lnr = (red + 1.0).ln();
                         let lng = (grn + 1.0).ln();
-                        pts.push(to_features_from_logs(&cfg.feature_space, lnr, lng));
-                        let rsum = (samples[si].x_red[p] as u32) + (samples[si].y_grn[p] as u32);
+                        pts.push(to_features_from_logs(
+                            &cfg.feature_space, lnr, lng,
+                        ));
+                        let rsum = (samples[si].x_red[p] as u32)
+                            + (samples[si].y_grn[p] as u32);
                         raw.push(rsum);
                     }
 
-                    let mut model =
-                        choose_k(&pts, cfg.k_max, cfg.max_iters, cfg.tol, cfg.seed, cfg.restarts);
+                    let mut model = choose_k(
+                        &pts,
+                        cfg.k_max,
+                        cfg.max_iters,
+                        cfg.tol,
+                        cfg.seed,
+                        cfg.restarts,
+                    );
 
+                    // lightweight heuristics (unchanged)
                     const GAP3_TO_2: f64 = 0.035;
                     const GAP2_TO_1: f64 = 0.020;
                     const MIN_W: f64 = 0.03;
-                    let sorted_thetas = |means: &[(f64, f64)], w_theta: f64| -> Vec<f64> {
-                        let wth = w_theta.max(1e-9);
-                        let mut t: Vec<f64> = means.iter().map(|m| m.0 / wth).collect();
-                        t.sort_by(|a, b| a.partial_cmp(b).unwrap());
-                        t
-                    };
+                    let sorted_thetas =
+                        |means: &[(f64, f64)], w_theta: f64| -> Vec<f64> {
+                            let wth = w_theta.max(1e-9);
+                            let mut t: Vec<f64> =
+                                means.iter().map(|m| m.0 / wth).collect();
+                            t.sort_by(|a, b| a.partial_cmp(b).unwrap());
+                            t
+                        };
                     {
                         let wth = cfg.feature_space.w_theta;
                         if model.k > 1 && model.weights.iter().any(|&w| w < MIN_W) {
@@ -515,8 +926,9 @@ pub fn run_from_pairs(
                         }
                         let t = sorted_thetas(&model.means, wth);
                         if model.k == 3 {
-                            let min_gap =
-                                (t[1] - t[0]).abs().min((t[2] - t[1]).abs());
+                            let min_gap = (t[1] - t[0])
+                                .abs()
+                                .min((t[2] - t[1]).abs());
                             if min_gap < GAP3_TO_2 {
                                 let m2 = fit_diag_restarts(
                                     &pts,
@@ -528,7 +940,11 @@ pub fn run_from_pairs(
                                 );
                                 let t2 = sorted_thetas(&m2.means, wth);
                                 let gap = (t2[1] - t2[0]).abs();
-                                model = if gap < GAP2_TO_1 { fit_k1(&pts) } else { m2 };
+                                model = if gap < GAP2_TO_1 {
+                                    fit_k1(&pts)
+                                } else {
+                                    m2
+                                };
                             }
                         } else if model.k == 2 {
                             let gap = (t[1] - t[0]).abs();
@@ -554,7 +970,7 @@ pub fn run_from_pairs(
                 .collect()
         };
 
-        // ---- 2) Auto τ once (cheap; measure)
+        // ================= τ (auto once) =================
         if tau_opt.is_none() {
             let _s = prof.scope("auto_tau");
             let mut ps = Vec::new();
@@ -567,20 +983,21 @@ pub fn run_from_pairs(
             }
             let tau = auto_tau_from_posteriors(ps, alpha_default);
             tau_opt = Some(tau);
-            eprintln!("AUTO τ via FDR α={:.4} -> τ={:.4}", alpha_default, tau);
+            eprintln!(
+                "AUTO τ via FDR α={:.4} -> τ={:.4}",
+                alpha_default, tau
+            );
         }
         let tau = tau_opt.unwrap();
 
-        // per-SNP nocall counter
+       // per-SNP nocall counter
         let mut nocall_per_snp: HashMap<u32, u64> = HashMap::new();
 
-        // ---- 3) Finalize calls + write rows
+        // ---- Finalize calls + write rows ----
         {
-            // Use manual span to allow nested scopes inside.
             let idx_finalize = prof.start("chunk_finalize_and_write");
-
             for r in rows {
-                let mut out = Vec::with_capacity(1 + s);
+                let mut out = Vec::with_capacity(1 + s_samples);
                 out.push(r.id.to_string());
 
                 let names: Vec<&'static str> =
@@ -589,22 +1006,24 @@ pub fn run_from_pairs(
                 let mut this_snp_nocall_all: u64 = 0;
 
                 // Precompute features for geometry/maha
-                let mut pts_cache: Vec<(f64, f64)> = Vec::with_capacity(s);
-                for si in 0..s {
+                let mut pts_cache: Vec<(f64, f64)> = Vec::with_capacity(s_samples);
+                for si in 0..s_samples {
                     let p = pos_index[si][r.idx];
                     let red = samples[si].x_red[p] as f64;
                     let grn = samples[si].y_grn[p] as f64;
                     let lnr = (red + 1.0).ln();
                     let lng = (grn + 1.0).ln();
-                    pts_cache.push(to_features_from_logs(&cfg.feature_space, lnr, lng));
+                    pts_cache.push(to_features_from_logs(
+                        &cfg.feature_space, lnr, lng,
+                    ));
                 }
 
-                // Refined centres
+                // Refined centres (same logic as before)
                 let mut refined = r.means.clone();
                 if !r.means.is_empty() {
                     let k = r.means.len();
                     let mut acc = vec![(0.0f64, 0.0f64, 0.0f64); k]; // sumx,sumy,sumw
-                    for si in 0..s {
+                    for si in 0..s_samples {
                         if r.post[si] >= tau {
                             let j = safe_lab_index(r.id, r.labs[si], k);
                             let (x, y) = pts_cache[si];
@@ -623,8 +1042,8 @@ pub fn run_from_pairs(
                 }
 
                 // Mahalanobis gate vs refined centres
-                let mut m_gate_refined = vec![false; s];
-                for si in 0..s {
+                let mut m_gate_refined = vec![false; s_samples];
+                for si in 0..s_samples {
                     if r.post[si] >= tau {
                         let j = safe_lab_index(r.id, r.labs[si], refined.len());
                         let m2r = maha2_diag(pts_cache[si], refined[j], r.vars[j]);
@@ -635,7 +1054,7 @@ pub fn run_from_pairs(
                 }
 
                 // Write calls & update stats/feedback
-                for si in 0..s {
+                for si in 0..s_samples {
                     let st = &mut stats[si];
                     st.total += 1;
 
@@ -658,7 +1077,7 @@ pub fn run_from_pairs(
                         st.nocall_p += 1;
                         st.nocall_maha += 1;
                         out.push("NoCall".into());
-                        this_snp_nocall_all += 1; 
+                        this_snp_nocall_all += 1;
                         let e = fb.entry(r.id).or_default();
                         e.seen += 1;
                         e.nocall_p += 1;
@@ -673,13 +1092,14 @@ pub fn run_from_pairs(
                         e.seen += 1;
                         e.nocall_p += 1;
                     } else {
-                        let jlab0 = safe_lab_index(r.id, r.labs[si], r.means.len());
+                        let jlab0 =
+                            safe_lab_index(r.id, r.labs[si], r.means.len());
                         let call = names[jlab0];
                         let strong = 0.97;
                         let band = 0.04;
 
-                        let theta_sample =
-                            pts_cache[si].0 / cfg.feature_space.w_theta.max(1e-9);
+                        let theta_sample = pts_cache[si].0
+                            / cfg.feature_space.w_theta.max(1e-9);
                         let ok = r.post[si] >= strong
                             || theta_guard_ok(
                                 &refined,
@@ -714,25 +1134,29 @@ pub fn run_from_pairs(
                 }
 
                 // ----- Plots + Debug -----
-                let is_debug_this = cfg.debug_snp.map(|ds| ds == r.id).unwrap_or(false);
-                let do_plot = (cfg.plot_first_snps > 0 && plots_emitted < cfg.plot_first_snps)
+                let is_debug_this =
+                    cfg.debug_snp.map(|ds| ds == r.id).unwrap_or(false);
+                let do_plot = (cfg.plot_first_snps > 0
+                    && plots_emitted < cfg.plot_first_snps)
                     || is_debug_this;
 
                 // recompute feature points for this SNP (same as clustering pass)
-                let mut pts = Vec::with_capacity(s);
-                for si in 0..s {
+                let mut pts = Vec::with_capacity(s_samples);
+                for si in 0..s_samples {
                     let p = pos_index[si][r.idx];
                     let red = samples[si].x_red[p] as f64;
                     let grn = samples[si].y_grn[p] as f64;
                     let lnr = (red + 1.0).ln();
                     let lng = (grn + 1.0).ln();
-                    pts.push(to_features_from_logs(&cfg.feature_space, lnr, lng));
+                    pts.push(to_features_from_logs(
+                        &cfg.feature_space, lnr, lng,
+                    ));
                 }
 
                 // Build final per-sample calls exactly like CSV logic (incl refined maha gate)
-                let mut final_calls: Vec<String> = Vec::with_capacity(s);
-                let mut maha_flags: Vec<bool> = Vec::with_capacity(s);
-                for si in 0..s {
+                let mut final_calls: Vec<String> = Vec::with_capacity(s_samples);
+                let mut maha_flags: Vec<bool> = Vec::with_capacity(s_samples);
+                for si in 0..s_samples {
                     let c = if r.raw[si] < r_min {
                         "NoCall".to_string()
                     } else if r.post[si] < tau {
@@ -740,12 +1164,13 @@ pub fn run_from_pairs(
                     } else if m_gate_refined[si] {
                         "NoCall".to_string()
                     } else {
-                        let jlab0 = safe_lab_index(r.id, r.labs[si], r.means.len());
+                        let jlab0 =
+                            safe_lab_index(r.id, r.labs[si], r.means.len());
                         let call = names[jlab0];
                         let strong = 0.97;
                         let band = 0.04;
-                        let theta_sample =
-                            pts[si].0 / cfg.feature_space.w_theta.max(1e-9);
+                        let theta_sample = pts[si].0
+                            / cfg.feature_space.w_theta.max(1e-9);
                         if r.post[si] >= strong
                             || theta_guard_ok(
                                 &refined,
@@ -763,11 +1188,12 @@ pub fn run_from_pairs(
                     maha_flags.push(m_gate_refined[si]); // use refined gate flags in plot
                 }
 
-                // 1) Plot (own scope)
+                // 1) Plot
                 if do_plot {
                     {
                         let _s_plot = prof.scope("plot_one_snp");
-                        let plot_path_base = plots_dir.join(format!("snp_{:08}", r.id));
+                        let plot_path_base =
+                            plots_dir.join(format!("snp_{:08}", r.id));
                         let _ = write_cluster_scatter_png_calls(
                             &plot_path_base,
                             r.id,
@@ -779,12 +1205,13 @@ pub fn run_from_pairs(
                             Some(&refined),
                         );
                     }
-                    if cfg.plot_first_snps > 0 && plots_emitted < cfg.plot_first_snps {
+                    if cfg.plot_first_snps > 0 && plots_emitted < cfg.plot_first_snps
+                    {
                         plots_emitted += 1;
                     }
                 }
 
-                // 2) Debug CSV (separate scope, after plot scope ends)
+                // 2) Debug CSV
                 if is_debug_this {
                     {
                         let _s_dbg = prof.scope("debug_csv_one_snp");
@@ -808,8 +1235,6 @@ pub fn run_from_pairs(
             if let Some(w) = w_opt.as_mut() {
                 w.flush().map_err(|e| e.to_string())?;
             }
-
-            // Close the manual span
             prof.end(idx_finalize);
         }
 
@@ -817,7 +1242,7 @@ pub fn run_from_pairs(
         if cfg.nocall_bad_thresh > 0.0 {
             let _s = prof.scope("update_bad_snps_after_chunk");
             for (id, n_no) in nocall_per_snp {
-                let rate = (n_no as f64) / (s as f64);
+                let rate = (n_no as f64) / (s_samples as f64);
                 if rate >= cfg.nocall_bad_thresh {
                     bad.insert(id);
                     let e = fb.entry(id).or_default();
@@ -839,7 +1264,7 @@ pub fn run_from_pairs(
             "nocall_p_at_tau",
             "nocall_maha_at_tau",
             "calls_at_tau",
-            "calls_at_p090",
+            "calls_p090",
             "call_rate_tau",
             "call_rate_p090",
             "r_min_used",
@@ -960,30 +1385,29 @@ fn write_cluster_scatter_png_calls(
     let xlab = parts.next().unwrap_or("x");
     let ylab = parts.next().unwrap_or("y");
 
-        // Larger canvas for higher-resolution text
-        let root = BitMapBackend::new(&outfile_str, (1400, 1000)).into_drawing_area();
-        root.fill(&WHITE).map_err(|e| e.to_string())?;
+    // Larger canvas for higher-resolution text
+    let root = BitMapBackend::new(&outfile_str, (1400, 1000)).into_drawing_area();
+    root.fill(&WHITE).map_err(|e| e.to_string())?;
 
-        // Bigger margins and label areas to fit larger fonts
-        let mut chart = ChartBuilder::on(&root)
-            .caption(
-                format!("SNP {} — {}", snp_id, feature_label),
-                ("sans-serif", 32).into_font(), 
-            )
-            .margin(25)
-            .x_label_area_size(70)           
-            .y_label_area_size(80)           
-            .build_cartesian_2d((xmin - padx)..(xmax + padx), (ymin - pady)..(ymax + pady))
-            .map_err(|e| e.to_string())?;
-
-        chart
-            .configure_mesh()
-            .x_desc(xlab)
-            .y_desc(ylab)
-            .axis_desc_style(("sans-serif", 35)) // larger axis titles
-            .label_style(("sans-serif", 30))     // larger tick labels
-            .draw()
-            .map_err(|e| e.to_string())?;
+    // Bigger margins and label areas to fit larger fonts
+    let mut chart = ChartBuilder::on(&root)
+        .caption(
+            format!("SNP {} — {}", snp_id, feature_label),
+            ("sans-serif", 32).into_font(), 
+        )
+        .margin(25)
+        .x_label_area_size(70)           
+        .y_label_area_size(80)           
+        .build_cartesian_2d((xmin - padx)..(xmax + padx), (ymin - pady)..(ymax + pady))
+        .map_err(|e| e.to_string())?;
+    chart
+        .configure_mesh()
+        .x_desc(xlab)
+        .y_desc(ylab)
+        .axis_desc_style(("sans-serif", 35)) // larger axis titles
+        .label_style(("sans-serif", 30))     // larger tick labels
+        .draw()
+        .map_err(|e| e.to_string())?;
 
     // Group indices by final call (NoCall excluded from drawing)
     let mut idx_aa = Vec::new();
@@ -1050,15 +1474,15 @@ fn write_cluster_scatter_png_calls(
         .label("Centre")
         .legend(|(x, y)| Cross::new((x, y), 7, &BLACK));
 
-        chart
-            .configure_series_labels()
-            .position(SeriesLabelPosition::UpperRight)
-            .border_style(&BLACK)
-            .background_style(WHITE.mix(0.85))
-            .label_font(("sans-serif", 30))
-            .draw()
-            .map_err(|e| e.to_string())?;
-
+    chart
+        .configure_series_labels()
+        .position(SeriesLabelPosition::UpperRight)
+        .border_style(&BLACK)
+        .background_style(WHITE.mix(0.85))
+        .label_font(("sans-serif", 30))
+        .draw()
+        .map_err(|e| e.to_string())?;
+    
     root.present().map_err(|e| e.to_string())?;
     Ok(file_to_return)
 }
