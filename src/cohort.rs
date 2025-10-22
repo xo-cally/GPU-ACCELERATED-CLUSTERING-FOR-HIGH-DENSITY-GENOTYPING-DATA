@@ -571,8 +571,8 @@ pub fn run_from_pairs(
         }
         let tau = tau_opt.unwrap();
 
-        // per-SNP nocall@τ counter
-        let mut nocall_tau_per_snp: HashMap<u32, u64> = HashMap::new();
+        // per-SNP nocall counter
+        let mut nocall_per_snp: HashMap<u32, u64> = HashMap::new();
 
         // ---- 3) Finalize calls + write rows
         {
@@ -586,7 +586,7 @@ pub fn run_from_pairs(
                 let names: Vec<&'static str> =
                     map_labels_for_snp_strict(&r.means, cfg.feature_space.w_theta);
 
-                let mut this_snp_nocall_tau: u64 = 0;
+                let mut this_snp_nocall_all: u64 = 0;
 
                 // Precompute features for geometry/maha
                 let mut pts_cache: Vec<(f64, f64)> = Vec::with_capacity(s);
@@ -642,6 +642,7 @@ pub fn run_from_pairs(
                     if r.raw[si] < r_min {
                         st.nocall_raw += 1;
                         out.push("NoCall".into());
+                        this_snp_nocall_all += 1;
                         let e = fb.entry(r.id).or_default();
                         e.seen += 1;
                         e.nocall_raw += 1;
@@ -657,7 +658,7 @@ pub fn run_from_pairs(
                         st.nocall_p += 1;
                         st.nocall_maha += 1;
                         out.push("NoCall".into());
-                        this_snp_nocall_tau += 1;
+                        this_snp_nocall_all += 1; 
                         let e = fb.entry(r.id).or_default();
                         e.seen += 1;
                         e.nocall_p += 1;
@@ -667,7 +668,7 @@ pub fn run_from_pairs(
                     if r.post[si] < tau {
                         st.nocall_p += 1;
                         out.push("NoCall".into());
-                        this_snp_nocall_tau += 1;
+                        this_snp_nocall_all += 1;
                         let e = fb.entry(r.id).or_default();
                         e.seen += 1;
                         e.nocall_p += 1;
@@ -696,7 +697,7 @@ pub fn run_from_pairs(
                         } else {
                             st.nocall_p += 1;
                             out.push("NoCall".into());
-                            this_snp_nocall_tau += 1;
+                            this_snp_nocall_all += 1;
                             let e = fb.entry(r.id).or_default();
                             e.seen += 1;
                             e.nocall_p += 1;
@@ -705,7 +706,7 @@ pub fn run_from_pairs(
                 }
 
                 // learn bad SNPs
-                nocall_tau_per_snp.insert(r.id, this_snp_nocall_tau);
+                nocall_per_snp.insert(r.id, this_snp_nocall_all);
 
                 // append row (only if enabled)
                 if let Some(w) = w_opt.as_mut() {
@@ -815,7 +816,7 @@ pub fn run_from_pairs(
         // After chunk: update bad SNPs set
         if cfg.nocall_bad_thresh > 0.0 {
             let _s = prof.scope("update_bad_snps_after_chunk");
-            for (id, n_no) in nocall_tau_per_snp {
+            for (id, n_no) in nocall_per_snp {
                 let rate = (n_no as f64) / (s as f64);
                 if rate >= cfg.nocall_bad_thresh {
                     bad.insert(id);
@@ -959,27 +960,30 @@ fn write_cluster_scatter_png_calls(
     let xlab = parts.next().unwrap_or("x");
     let ylab = parts.next().unwrap_or("y");
 
-    let root = BitMapBackend::new(&outfile_str, (1000, 740)).into_drawing_area();
-    root.fill(&WHITE).map_err(|e| e.to_string())?;
+        // Larger canvas for higher-resolution text
+        let root = BitMapBackend::new(&outfile_str, (1400, 1000)).into_drawing_area();
+        root.fill(&WHITE).map_err(|e| e.to_string())?;
 
-    let mut chart = ChartBuilder::on(&root)
-        .caption(
-            format!("SNP {} — {}", snp_id, feature_label),
-            ("sans-serif", 26).into_font(),
-        )
-        .margin(20)
-        .x_label_area_size(45)
-        .y_label_area_size(55)
-        .build_cartesian_2d((xmin - padx)..(xmax + padx), (ymin - pady)..(ymax + pady))
-        .map_err(|e| e.to_string())?;
+        // Bigger margins and label areas to fit larger fonts
+        let mut chart = ChartBuilder::on(&root)
+            .caption(
+                format!("SNP {} — {}", snp_id, feature_label),
+                ("sans-serif", 32).into_font(), 
+            )
+            .margin(25)
+            .x_label_area_size(70)           
+            .y_label_area_size(80)           
+            .build_cartesian_2d((xmin - padx)..(xmax + padx), (ymin - pady)..(ymax + pady))
+            .map_err(|e| e.to_string())?;
 
-    chart
-        .configure_mesh()
-        .x_desc(xlab)
-        .y_desc(ylab)
-        .label_style(("sans-serif", 14))
-        .draw()
-        .map_err(|e| e.to_string())?;
+        chart
+            .configure_mesh()
+            .x_desc(xlab)
+            .y_desc(ylab)
+            .axis_desc_style(("sans-serif", 35)) // larger axis titles
+            .label_style(("sans-serif", 30))     // larger tick labels
+            .draw()
+            .map_err(|e| e.to_string())?;
 
     // Group indices by final call (NoCall excluded from drawing)
     let mut idx_aa = Vec::new();
@@ -1046,14 +1050,14 @@ fn write_cluster_scatter_png_calls(
         .label("Centre")
         .legend(|(x, y)| Cross::new((x, y), 7, &BLACK));
 
-    chart
-        .configure_series_labels()
-        .position(SeriesLabelPosition::UpperRight)
-        .border_style(&BLACK)
-        .background_style(WHITE.mix(0.85))
-        .label_font(("sans-serif", 14))
-        .draw()
-        .map_err(|e| e.to_string())?;
+        chart
+            .configure_series_labels()
+            .position(SeriesLabelPosition::UpperRight)
+            .border_style(&BLACK)
+            .background_style(WHITE.mix(0.85))
+            .label_font(("sans-serif", 30))
+            .draw()
+            .map_err(|e| e.to_string())?;
 
     root.present().map_err(|e| e.to_string())?;
     Ok(file_to_return)
