@@ -290,14 +290,10 @@ fn theta_guard_ok(
 }
 
 // ---- small helpers for GPU path ----
+#[cfg(feature = "gpu")]
 #[inline]
 fn use_gpu_runtime() -> bool {
     std::env::var("USE_GPU").as_deref() != Ok("0")
-}
-
-#[cfg(feature = "gpu")]
-fn gpu_debug() -> bool {
-    std::env::var("GPU_DEBUG").as_deref() == Ok("1")
 }
 
 #[cfg(feature = "gpu")]
@@ -471,6 +467,7 @@ pub fn run_from_pairs(
 
     for chunk_start in (0..m).step_by(block) {
         let end = (chunk_start + block).min(m);
+        #[cfg(feature = "gpu")]
         let b = end - chunk_start; // SNPs in this chunk
         let s_samples = s;
 
@@ -485,236 +482,481 @@ pub fn run_from_pairs(
             vars: Vec<(f64, f64)>,
         }
 
-        // ==================== GPU fast path (batched) ====================
-        let try_gpu = {
+        // ==================== Build rows (GPU when enabled, else CPU) ====================
+        let rows: Vec<Row> = {
+            // ---------- When compiled with `--features gpu` ----------
             #[cfg(feature = "gpu")]
             {
-                use_gpu_runtime() && cfg.k_max <= 3 && s_samples >= gpu_min_n()
-            }
-            #[cfg(not(feature = "gpu"))]
-            {
-                false
-            }
-        };
+                // Decide at runtime whether to try GPU
+                let try_gpu = use_gpu_runtime() && cfg.k_max <= 3 && s_samples >= gpu_min_n();
 
-        let rows: Vec<Row> = if try_gpu {
-            // --------------- Build SoA batch (xs,ys), raw sums, cache pts ---------------
-            let _s = prof.scope("chunk_cluster_em_bic");
-            let mut xs: Vec<f32> = Vec::with_capacity(b * s_samples);
-            let mut ys: Vec<f32> = Vec::with_capacity(b * s_samples);
-            let mut raw_sums: Vec<Vec<u32>> = vec![vec![0u32; s_samples]; b];
-            let mut pts_batch: Vec<Vec<(f64, f64)>> = vec![Vec::with_capacity(s_samples); b];
+                if try_gpu {
+                    use crate::model::{gpu_bic_batched, gpu_em_one_iter_batched_k, BatchEmOut};
 
-            for (bj, j) in (chunk_start..end).enumerate() {
-                for si in 0..s_samples {
-                    let p = pos_index[si][j];
-                    let red = samples[si].x_red[p] as f64;
-                    let grn = samples[si].y_grn[p] as f64;
-                    let lnr = (red + 1.0).ln();
-                    let lng = (grn + 1.0).ln();
-                    let (th, rr) = to_features_from_logs(&cfg.feature_space, lnr, lng);
-                    xs.push(th as f32);
-                    ys.push(rr as f32);
-                    raw_sums[bj][si] =
-                        (samples[si].x_red[p] as u32) + (samples[si].y_grn[p] as u32);
-                    pts_batch[bj].push((th, rr));
-                }
-            }
+                    // --------------- Build SoA batch (xs,ys), raw sums, cache pts ---------------
+                    let mut xs: Vec<f32> = Vec::with_capacity(b * s_samples);
+                    let mut ys: Vec<f32> = Vec::with_capacity(b * s_samples);
+                    let mut raw_sums: Vec<Vec<u32>> = vec![vec![0u32; s_samples]; b];
+                    let mut pts_batch: Vec<Vec<(f64, f64)>> = vec![Vec::with_capacity(s_samples); b];
 
-            // --------------- Initial params per K (simple quantile seeding) ---------------
-            #[inline]
-            fn init_for_k(
-                pts: &[(f64, f64)],
-                k: usize,
-            ) -> (Vec<f32>, Vec<f32>, Vec<f32>, Vec<f32>, Vec<f32>) {
-                let n = pts.len().max(1);
-                let mut mx = 0.0;
-                let mut my = 0.0;
-                for &(x, y) in pts {
-                    mx += x;
-                    my += y;
-                }
-                mx /= n as f64;
-                my /= n as f64;
-                let mut vx = 0.0;
-                let mut vy = 0.0;
-                for &(x, y) in pts {
-                    vx += (x - mx) * (x - mx);
-                    vy += (y - my) * (y - my);
-                }
-                vx = (vx / n as f64).max(1e-2);
-                vy = (vy / n as f64).max(1e-2);
-
-                let mut idx: Vec<usize> = (0..n).collect();
-                idx.sort_by(|&a, &b| pts[a].0.partial_cmp(&pts[b].0).unwrap()); // sort by theta
-
-                let mut pick = Vec::with_capacity(k);
-                for t in 1..=k {
-                    let pos =
-                        ((t as f64) / ((k + 1) as f64) * (n as f64)).floor() as usize;
-                    pick.push(idx[pos.min(n - 1)]);
-                }
-
-                let w = vec![1.0f32 / k as f32; k];
-                let mut mxs = vec![0.0f32; k];
-                let mut mys = vec![0.0f32; k];
-                let vxs = vec![vx as f32; k];
-                let vys = vec![vy as f32; k];
-                for (j, &pi) in pick.iter().enumerate() {
-                    mxs[j] = pts[pi].0 as f32;
-                    mys[j] = pts[pi].1 as f32;
-                }
-                (w, mxs, mys, vxs, vys)
-            }
-
-            #[cfg(feature = "gpu")]
-            use crate::model::{gpu_bic_batched, gpu_em_one_iter_batched_k, BatchEmOut};
-
-            let kmax = cfg.k_max.min(3);
-            struct KF {
-                w: Vec<f32>,
-                mx: Vec<f32>,
-                my: Vec<f32>,
-                vx: Vec<f32>,
-                vy: Vec<f32>,
-                ll: Vec<f32>,
-                bic: Vec<f32>,
-                k: usize,
-            }
-            let mut fits: Vec<KF> = Vec::new();
-
-            for k in 1..=kmax {
-                // concat initial params for the whole batch
-                let mut w0: Vec<f32> = Vec::with_capacity(b * k);
-                let mut mx0: Vec<f32> = Vec::with_capacity(b * k);
-                let mut my0: Vec<f32> = Vec::with_capacity(b * k);
-                let mut vx0: Vec<f32> = Vec::with_capacity(b * k);
-                let mut vy0: Vec<f32> = Vec::with_capacity(b * k);
-
-                for bj in 0..b {
-                    let (w, mx, my, vx, vy) = init_for_k(&pts_batch[bj], k);
-                    w0.extend_from_slice(&w);
-                    mx0.extend_from_slice(&mx);
-                    my0.extend_from_slice(&my);
-                    vx0.extend_from_slice(&vx);
-                    vy0.extend_from_slice(&vy);
-                }
-
-                // EM loop on GPU
-                let mut cur_w = w0;
-                let mut cur_mx = mx0;
-                let mut cur_my = my0;
-                let mut cur_vx = vx0;
-                let mut cur_vy = vy0;
-                let mut last_ll: Option<Vec<f32>> = None;
-
-                for _it in 0..cfg.max_iters {
-                    if let Some(BatchEmOut {
-                        w,
-                        mx,
-                        my,
-                        vx,
-                        vy,
-                        ll,
-                    }) = gpu_em_one_iter_batched_k(
-                        &xs,
-                        &ys,
-                        s_samples,
-                        b,
-                        k,
-                        &cur_w,
-                        &cur_mx,
-                        &cur_my,
-                        &cur_vx,
-                        &cur_vy,
-                    ) {
-                        // check mean improvement over batch
-                        if let Some(prev) = last_ll.as_ref() {
-                            let mut delta = 0.0f64;
-                            for i in 0..b {
-                                delta += (ll[i] as f64 - prev[i] as f64).abs();
-                            }
-                            delta /= b as f64;
-                            if delta <= cfg.tol {
-                                cur_w = w;
-                                cur_mx = mx;
-                                cur_my = my;
-                                cur_vx = vx;
-                                cur_vy = vy;
-                                last_ll = Some(ll);
-                                break;
-                            }
-                        }
-                        cur_w = w;
-                        cur_mx = mx;
-                        cur_my = my;
-                        cur_vx = vx;
-                        cur_vy = vy;
-                        last_ll = Some(ll);
-                    } else {
-                        // GPU failed -> abort GPU path
-                        last_ll = None;
-                        break;
-                    }
-                }
-
-                let Some(ll_vec) = last_ll else {
-                    // abort GPU branch entirely -> fall back to CPU below
-                    fits.clear();
-                    break;
-                };
-
-                // BIC on GPU
-                let bic_vec = gpu_bic_batched(s_samples, b, k, &ll_vec).unwrap_or_else(|| {
-                    // tiny CPU fallback just in case
-                    let p = ((k - 1) + 4 * k) as f32;
-                    ll_vec
-                        .iter()
-                        .map(|&ll| -2.0 * ll + p * (s_samples as f32).ln())
-                        .collect()
-                });
-
-                fits.push(KF {
-                    w: cur_w,
-                    mx: cur_mx,
-                    my: cur_my,
-                    vx: cur_vx,
-                    vy: cur_vy,
-                    ll: ll_vec,
-                    bic: bic_vec,
-                    k,
-                });
-            }
-
-            // If GPU path failed mid-way, drop to CPU path
-            let rows_gpu_or_cpu: Vec<Row> = if fits.is_empty() {
-                if cfg!(feature = "gpu") {
-                    #[cfg(feature = "gpu")]
-                    if gpu_debug() {
-                        eprintln!(
-                            "[GPU] batched path unavailable -> CPU fallback"
-                        );
-                    }
-                }
-                // ==== CPU fallback, identical to the non-GPU branch ====
-                (chunk_start..end)
-                    .into_par_iter()
-                    .map(|j| {
-                        let id = ids[j];
-                        let mut pts = Vec::with_capacity(s_samples);
-                        let mut raw = Vec::with_capacity(s_samples);
-
+                    for (bj, j) in (chunk_start..end).enumerate() {
                         for si in 0..s_samples {
                             let p = pos_index[si][j];
                             let red = samples[si].x_red[p] as f64;
                             let grn = samples[si].y_grn[p] as f64;
                             let lnr = (red + 1.0).ln();
                             let lng = (grn + 1.0).ln();
-                            pts.push(to_features_from_logs(
-                                &cfg.feature_space, lnr, lng,
-                            ));
-                            let rsum = (samples[si].x_red[p] as u32)
-                                + (samples[si].y_grn[p] as u32);
+                            let (th, rr) = to_features_from_logs(&cfg.feature_space, lnr, lng);
+                            xs.push(th as f32);
+                            ys.push(rr as f32);
+                            raw_sums[bj][si] =
+                                (samples[si].x_red[p] as u32) + (samples[si].y_grn[p] as u32);
+                            pts_batch[bj].push((th, rr));
+                        }
+                    }
+
+                    #[inline]
+                    fn init_for_k(
+                        pts: &[(f64, f64)],
+                        k: usize,
+                    ) -> (Vec<f32>, Vec<f32>, Vec<f32>, Vec<f32>, Vec<f32>) {
+                        let n = pts.len().max(1);
+                        let (mut mx, mut my) = (0.0, 0.0);
+                        for &(x, y) in pts {
+                            mx += x;
+                            my += y;
+                        }
+                        mx /= n as f64;
+                        my /= n as f64;
+                        let (mut vx, mut vy) = (0.0, 0.0);
+                        for &(x, y) in pts {
+                            vx += (x - mx) * (x - mx);
+                            vy += (y - my) * (y - my);
+                        }
+                        vx = (vx / n as f64).max(1e-2);
+                        vy = (vy / n as f64).max(1e-2);
+
+                        let mut idx: Vec<usize> = (0..n).collect();
+                        idx.sort_by(|&a, &b| pts[a].0.partial_cmp(&pts[b].0).unwrap());
+                        let mut pick = Vec::with_capacity(k);
+                        for t in 1..=k {
+                            let pos = ((t as f64) / ((k + 1) as f64) * (n as f64)).floor() as usize;
+                            pick.push(idx[pos.min(n - 1)]);
+                        }
+
+                        let w = vec![1.0f32 / k as f32; k];
+                        let mut mxs = vec![0.0f32; k];
+                        let mut mys = vec![0.0f32; k];
+                        let vxs = vec![vx as f32; k];
+                        let vys = vec![vy as f32; k];
+                        for (j, &pi) in pick.iter().enumerate() {
+                            mxs[j] = pts[pi].0 as f32;
+                            mys[j] = pts[pi].1 as f32;
+                        }
+                        (w, mxs, mys, vxs, vys)
+                    }
+
+                    let kmax = cfg.k_max.min(3);
+                    struct KF {
+                        w: Vec<f32>, mx: Vec<f32>, my: Vec<f32>, vx: Vec<f32>, vy: Vec<f32>,
+                        bic: Vec<f32>, k: usize,
+                    }
+                    let mut fits: Vec<KF> = Vec::new();
+
+                    {
+                        let _s = prof.scope("chunk_cluster_em_bic");
+
+                        for k in 1..=kmax {
+                            let mut w0 = Vec::with_capacity(b * k);
+                            let mut mx0 = Vec::with_capacity(b * k);
+                            let mut my0 = Vec::with_capacity(b * k);
+                            let mut vx0 = Vec::with_capacity(b * k);
+                            let mut vy0 = Vec::with_capacity(b * k);
+                            for bj in 0..b {
+                                let (w, mx, my, vx, vy) = init_for_k(&pts_batch[bj], k);
+                                w0.extend_from_slice(&w);
+                                mx0.extend_from_slice(&mx);
+                                my0.extend_from_slice(&my);
+                                vx0.extend_from_slice(&vx);
+                                vy0.extend_from_slice(&vy);
+                            }
+
+                            let mut cur_w = w0;
+                            let mut cur_mx = mx0;
+                            let mut cur_my = my0;
+                            let mut cur_vx = vx0;
+                            let mut cur_vy = vy0;
+                            let mut last_ll: Option<Vec<f32>> = None;
+
+                            for _it in 0..cfg.max_iters {
+                                if let Some(BatchEmOut { w, mx, my, vx, vy, ll }) = gpu_em_one_iter_batched_k(
+                                    &xs,
+                                    &ys,
+                                    s_samples,
+                                    b,
+                                    k,
+                                    &cur_w,
+                                    &cur_mx,
+                                    &cur_my,
+                                    &cur_vx,
+                                    &cur_vy,
+                                ) {
+                                    if let Some(prev) = last_ll.as_ref() {
+                                        let mut delta = 0.0f64;
+                                        for i in 0..b {
+                                            delta += (ll[i] as f64 - prev[i] as f64).abs();
+                                        }
+                                        delta /= b as f64;
+                                        if delta <= cfg.tol {
+                                            cur_w = w;
+                                            cur_mx = mx;
+                                            cur_my = my;
+                                            cur_vx = vx;
+                                            cur_vy = vy;
+                                            last_ll = Some(ll);
+                                            break;
+                                        }
+                                    }
+                                    cur_w = w;
+                                    cur_mx = mx;
+                                    cur_my = my;
+                                    cur_vx = vx;
+                                    cur_vy = vy;
+                                    last_ll = Some(ll);
+                                } else {
+                                    last_ll = None;
+                                    break;
+                                }
+                            }
+
+                            let Some(ll_vec) = last_ll else {
+                                fits.clear();
+                                break;
+                            };
+                            let bic_vec = gpu_bic_batched(s_samples, b, k, &ll_vec).unwrap_or_else(|| {
+                                let p = ((k - 1) + 4 * k) as f32;
+                                ll_vec
+                                    .iter()
+                                    .map(|&ll| -2.0 * ll + p * (s_samples as f32).ln())
+                                    .collect()
+                            });
+
+                            fits.push(KF {
+                                w: cur_w,
+                                mx: cur_mx,
+                                my: cur_my,
+                                vx: cur_vx,
+                                vy: cur_vy,
+                                bic: bic_vec,
+                                k,
+                            });
+                        }
+                    }
+
+                    if fits.is_empty() {
+                        // === CPU fallback (original) ===
+                        let _s = prof.scope("chunk_cluster_em_bic_cpu_fallback");
+                        (chunk_start..end)
+                            .into_par_iter()
+                            .map(|j| {
+                                let id = ids[j];
+                                let mut pts = Vec::with_capacity(s_samples);
+                                let mut raw = Vec::with_capacity(s_samples);
+
+                                for si in 0..s_samples {
+                                    let p = pos_index[si][j];
+                                    let red = samples[si].x_red[p] as f64;
+                                    let grn = samples[si].y_grn[p] as f64;
+                                    let lnr = (red + 1.0).ln();
+                                    let lng = (grn + 1.0).ln();
+                                    pts.push(to_features_from_logs(&cfg.feature_space, lnr, lng));
+                                    let rsum = (samples[si].x_red[p] as u32)
+                                        + (samples[si].y_grn[p] as u32);
+                                    raw.push(rsum);
+                                }
+
+                                let mut model = choose_k(
+                                    &pts,
+                                    cfg.k_max,
+                                    cfg.max_iters,
+                                    cfg.tol,
+                                    cfg.seed,
+                                    cfg.restarts,
+                                );
+
+                                const GAP3_TO_2: f64 = 0.035;
+                                const GAP2_TO_1: f64 = 0.020;
+                                const MIN_W: f64 = 0.03;
+                                let sorted_thetas = |means: &[(f64, f64)], w_theta: f64| -> Vec<f64> {
+                                    let wth = w_theta.max(1e-9);
+                                    let mut t: Vec<f64> = means.iter().map(|m| m.0 / wth).collect();
+                                    t.sort_by(|a, b| a.partial_cmp(b).unwrap());
+                                    t
+                                };
+                                {
+                                    let wth = cfg.feature_space.w_theta;
+                                    if model.k > 1 && model.weights.iter().any(|&w| w < MIN_W) {
+                                        model = if model.k == 3 {
+                                            fit_diag_restarts(
+                                                &pts,
+                                                2,
+                                                cfg.max_iters,
+                                                cfg.tol,
+                                                cfg.seed,
+                                                cfg.restarts,
+                                            )
+                                        } else {
+                                            fit_k1(&pts)
+                                        };
+                                    }
+                                    let t = sorted_thetas(&model.means, wth);
+                                    if model.k == 3 {
+                                        let min_gap =
+                                            (t[1] - t[0]).abs().min((t[2] - t[1]).abs());
+                                        if min_gap < GAP3_TO_2 {
+                                            let m2 = fit_diag_restarts(
+                                                &pts,
+                                                2,
+                                                cfg.max_iters,
+                                                cfg.tol,
+                                                cfg.seed,
+                                                cfg.restarts,
+                                            );
+                                            let t2 = sorted_thetas(&m2.means, wth);
+                                            let gap = (t2[1] - t2[0]).abs();
+                                            model = if gap < GAP2_TO_1 {
+                                                fit_k1(&pts)
+                                            } else {
+                                                m2
+                                            };
+                                        }
+                                    } else if model.k == 2 {
+                                        let gap = (t[1] - t[0]).abs();
+                                        if gap < GAP2_TO_1 {
+                                            model = fit_k1(&pts);
+                                        }
+                                    }
+                                }
+
+                                let (mut labs, mut post) = (Vec::new(), Vec::new());
+                                predict(&model, &pts, &mut labs, &mut post);
+
+                                Row {
+                                    idx: j,
+                                    id,
+                                    raw,
+                                    labs,
+                                    post,
+                                    means: model.means.clone(),
+                                    vars: model.vars.clone(),
+                                }
+                            })
+                            .collect()
+                    } else {
+                        // --- choose best K per SNP; collapse/gap; predict; push Rows ---
+                        let mut rows_gpu: Vec<Row> = Vec::with_capacity(b);
+
+                        for bj in 0..b {
+                            let id = ids[chunk_start + bj];
+
+                            let (best_k_idx, _) = fits
+                                .iter()
+                                .enumerate()
+                                .min_by(|a, b| a.1.bic[bj].partial_cmp(&b.1.bic[bj]).unwrap())
+                                .unwrap();
+                            let fbest = &fits[best_k_idx];
+                            let k = fbest.k;
+                            let off = bj * k;
+
+                            let weights: Vec<f64> =
+                                (0..k).map(|j| fbest.w[off + j] as f64).collect();
+                            let means: Vec<(f64, f64)> = (0..k)
+                                .map(|j| (fbest.mx[off + j] as f64, fbest.my[off + j] as f64))
+                                .collect();
+                            let vars: Vec<(f64, f64)> = (0..k)
+                                .map(|j| (fbest.vx[off + j] as f64, fbest.vy[off + j] as f64))
+                                .collect();
+
+                            let pts = &pts_batch[bj];
+                            let mut model = GmmDiag {
+                                k,
+                                weights,
+                                means,
+                                vars,
+                                loglik: 0.0,
+                            };
+
+                            const MIN_W: f64 = 0.03;
+                            const GAP3_TO_2: f64 = 0.035;
+                            const GAP2_TO_1: f64 = 0.020;
+
+                            let sorted_thetas =
+                                |means: &[(f64, f64)], w_theta: f64| -> Vec<f64> {
+                                    let wth = w_theta.max(1e-9);
+                                    let mut t: Vec<f64> =
+                                        means.iter().map(|m| m.0 / wth).collect();
+                                    t.sort_by(|a, b| a.partial_cmp(b).unwrap());
+                                    t
+                                };
+
+                            if model.k > 1 && model.weights.iter().any(|&w| w < MIN_W) {
+                                model = if model.k == 3 {
+                                    fit_diag_restarts(
+                                        pts,
+                                        2,
+                                        cfg.max_iters,
+                                        cfg.tol,
+                                        cfg.seed,
+                                        cfg.restarts,
+                                    )
+                                } else {
+                                    fit_k1(pts)
+                                };
+                            }
+
+                            let wth = cfg.feature_space.w_theta;
+                            if model.k == 3 {
+                                let t = sorted_thetas(&model.means, wth);
+                                let min_gap = (t[1] - t[0]).abs().min((t[2] - t[1]).abs());
+                                if min_gap < GAP3_TO_2 {
+                                    let m2 = fit_diag_restarts(
+                                        pts,
+                                        2,
+                                        cfg.max_iters,
+                                        cfg.tol,
+                                        cfg.seed,
+                                        cfg.restarts,
+                                    );
+                                    let t2 = sorted_thetas(&m2.means, wth);
+                                    let gap = (t2[1] - t2[0]).abs();
+                                    model = if gap < GAP2_TO_1 { fit_k1(pts) } else { m2 };
+                                }
+                            } else if model.k == 2 {
+                                let t = sorted_thetas(&model.means, wth);
+                                if (t[1] - t[0]).abs() < GAP2_TO_1 {
+                                    model = fit_k1(pts);
+                                }
+                            }
+
+                            let mut labs: Vec<usize> = Vec::new();
+                            let mut post: Vec<f64> = Vec::new();
+                            predict(&model, pts, &mut labs, &mut post);
+
+                            rows_gpu.push(Row {
+                                idx: chunk_start + bj,
+                                id,
+                                raw: raw_sums[bj].clone(),
+                                labs,
+                                post,
+                                means: model.means.clone(),
+                                vars: model.vars.clone(),
+                            });
+                        }
+
+                        rows_gpu
+                    }
+                } else {
+                    // ---------- Compiled with GPU feature, but runtime says "use CPU" ----------
+                    let _s = prof.scope("chunk_cluster_em_bic_cpu");
+                    (chunk_start..end)
+                        .into_par_iter()
+                        .map(|j| {
+                            let id = ids[j];
+                            let mut pts = Vec::with_capacity(s_samples);
+                            let mut raw = Vec::with_capacity(s_samples);
+
+                            for si in 0..s_samples {
+                                let p = pos_index[si][j];
+                                let red = samples[si].x_red[p] as f64;
+                                let grn = samples[si].y_grn[p] as f64;
+                                let lnr = (red + 1.0).ln();
+                                let lng = (grn + 1.0).ln();
+                                pts.push(to_features_from_logs(&cfg.feature_space, lnr, lng));
+                                let rsum = (samples[si].x_red[p] as u32)
+                                    + (samples[si].y_grn[p] as u32);
+                                raw.push(rsum);
+                            }
+
+                            let mut model = choose_k(
+                                &pts,
+                                cfg.k_max,
+                                cfg.max_iters,
+                                cfg.tol,
+                                cfg.seed,
+                                cfg.restarts,
+                            );
+
+                            const GAP3_TO_2: f64 = 0.035;
+                            const GAP2_TO_1: f64 = 0.020;
+                            const MIN_W: f64 = 0.03;
+                            let sorted_thetas = |means: &[(f64, f64)], w_theta: f64| -> Vec<f64> {
+                                let wth = w_theta.max(1e-9);
+                                let mut t: Vec<f64> = means.iter().map(|m| m.0 / wth).collect();
+                                t.sort_by(|a, b| a.partial_cmp(b).unwrap());
+                                t
+                            };
+                            {
+                                let wth = cfg.feature_space.w_theta;
+                                if model.k > 1 && model.weights.iter().any(|&w| w < MIN_W) {
+                                    model = if model.k == 3 {
+                                        fit_diag_restarts(&pts, 2, cfg.max_iters, cfg.tol, cfg.seed, cfg.restarts)
+                                    } else {
+                                        fit_k1(&pts)
+                                    };
+                                }
+                                let t = sorted_thetas(&model.means, wth);
+                                if model.k == 3 {
+                                    let min_gap = (t[1] - t[0]).abs().min((t[2] - t[1]).abs());
+                                    if min_gap < GAP3_TO_2 {
+                                        let m2 = fit_diag_restarts(&pts, 2, cfg.max_iters, cfg.tol, cfg.seed, cfg.restarts);
+                                        let t2 = sorted_thetas(&m2.means, wth);
+                                        let gap = (t2[1] - t2[0]).abs();
+                                        model = if gap < GAP2_TO_1 { fit_k1(&pts) } else { m2 };
+                                    }
+                                } else if model.k == 2 {
+                                    let gap = (t[1] - t[0]).abs();
+                                    if gap < GAP2_TO_1 {
+                                        model = fit_k1(&pts);
+                                    }
+                                }
+                            }
+
+                            let (mut labs, mut post) = (Vec::new(), Vec::new());
+                            predict(&model, &pts, &mut labs, &mut post);
+
+                            Row {
+                                idx: j,
+                                id,
+                                raw,
+                                labs,
+                                post,
+                                means: model.means.clone(),
+                                vars: model.vars.clone(),
+                            }
+                        })
+                        .collect()
+                }
+            }
+
+            // ---------- When compiled WITHOUT `--features gpu` ----------
+            #[cfg(not(feature = "gpu"))]
+            {
+                let _s = prof.scope("chunk_cluster_em_bic_cpu_only");
+                (chunk_start..end)
+                    .into_par_iter()
+                    .map(|j| {
+                        let id = ids[j];
+                        let mut pts = Vec::with_capacity(s_samples);
+                        let mut raw = Vec::with_capacity(s_samples);
+                        for si in 0..s_samples {
+                            let p = pos_index[si][j];
+                            let red = samples[si].x_red[p] as f64;
+                            let grn = samples[si].y_grn[p] as f64;
+                            let lnr = (red + 1.0).ln();
+                            let lng = (grn + 1.0).ln();
+                            pts.push(to_features_from_logs(&cfg.feature_space, lnr, lng));
+                            let rsum =
+                                (samples[si].x_red[p] as u32) + (samples[si].y_grn[p] as u32);
                             raw.push(rsum);
                         }
 
@@ -727,10 +969,10 @@ pub fn run_from_pairs(
                             cfg.restarts,
                         );
 
-                        // lightweight heuristics (unchanged)
                         const GAP3_TO_2: f64 = 0.035;
                         const GAP2_TO_1: f64 = 0.020;
                         const MIN_W: f64 = 0.03;
+
                         let sorted_thetas =
                             |means: &[(f64, f64)], w_theta: f64| -> Vec<f64> {
                                 let wth = w_theta.max(1e-9);
@@ -739,42 +981,26 @@ pub fn run_from_pairs(
                                 t.sort_by(|a, b| a.partial_cmp(b).unwrap());
                                 t
                             };
+
                         {
                             let wth = cfg.feature_space.w_theta;
-                            if model.k > 1
-                                && model.weights.iter().any(|&w| w < MIN_W)
-                            {
+
+                            if model.k > 1 && model.weights.iter().any(|&w| w < MIN_W) {
                                 model = if model.k == 3 {
-                                    fit_diag_restarts(
-                                        &pts,
-                                        2,
-                                        cfg.max_iters,
-                                        cfg.tol,
-                                        cfg.seed,
-                                        cfg.restarts,
-                                    )
+                                    fit_diag_restarts(&pts, 2, cfg.max_iters, cfg.tol, cfg.seed, cfg.restarts)
                                 } else {
                                     fit_k1(&pts)
                                 };
                             }
+
                             let t = sorted_thetas(&model.means, wth);
                             if model.k == 3 {
-                                let min_gap = (t[1] - t[0])
-                                    .abs()
-                                    .min((t[2] - t[1]).abs());
+                                let min_gap = (t[1] - t[0]).abs().min((t[2] - t[1]).abs());
                                 if min_gap < GAP3_TO_2 {
-                                    let m2 = fit_diag_restarts(
-                                        &pts,
-                                        2,
-                                        cfg.max_iters,
-                                        cfg.tol,
-                                        cfg.seed,
-                                        cfg.restarts,
-                                    );
+                                    let m2 = fit_diag_restarts(&pts, 2, cfg.max_iters, cfg.tol, cfg.seed, cfg.restarts);
                                     let t2 = sorted_thetas(&m2.means, wth);
                                     let gap = (t2[1] - t2[0]).abs();
-                                    model =
-                                        if gap < GAP2_TO_1 { fit_k1(&pts) } else { m2 };
+                                    model = if gap < GAP2_TO_1 { fit_k1(&pts) } else { m2 };
                                 }
                             } else if model.k == 2 {
                                 let gap = (t[1] - t[0]).abs();
@@ -798,176 +1024,7 @@ pub fn run_from_pairs(
                         }
                     })
                     .collect()
-            } else {
-                // ------- choose best K per SNP; compute posteriors/labels on CPU; build rows -------
-                let mut rows_gpu: Vec<Row> = Vec::with_capacity(b);
-
-                for bj in 0..b {
-                    let id = ids[chunk_start + bj];
-
-                    // pick K with min BIC
-                    let mut best_k_idx = 0usize;
-                    let mut best_bic = f32::INFINITY;
-                    for (ki, f) in fits.iter().enumerate() {
-                        let bval = f.bic[bj];
-                        if bval < best_bic {
-                            best_bic = bval;
-                            best_k_idx = ki;
-                        }
-                    }
-                    let fbest = &fits[best_k_idx];
-                    let k = fbest.k;
-
-                    // extract params for SNP bj
-                    let off = bj * k;
-                    let mut weights: Vec<f64> = Vec::with_capacity(k);
-                    let mut means: Vec<(f64, f64)> = Vec::with_capacity(k);
-                    let mut vars: Vec<(f64, f64)> = Vec::with_capacity(k);
-                    for j in 0..k {
-                        weights.push(fbest.w[off + j] as f64);
-                        means.push((
-                            fbest.mx[off + j] as f64,
-                            fbest.my[off + j] as f64,
-                        ));
-                        vars.push((
-                            fbest.vx[off + j] as f64,
-                            fbest.vy[off + j] as f64,
-                        ));
-                    }
-
-                    // compute posteriors/labels per-sample on CPU
-                    let pts = &pts_batch[bj];
-                    let mut labs: Vec<usize> = Vec::new();
-                    let mut post: Vec<f64> = Vec::new();
-                    let model = GmmDiag {
-                        k,
-                        weights: weights.clone(),
-                        means: means.clone(),
-                        vars: vars.clone(),
-                        loglik: 0.0,
-                    };
-                    predict(&model, pts, &mut labs, &mut post);
-
-                    rows_gpu.push(Row {
-                        idx: chunk_start + bj,
-                        id,
-                        raw: raw_sums[bj].clone(),
-                        labs,
-                        post,
-                        means,
-                        vars,
-                    });
-                }
-
-                rows_gpu
-            };
-
-            rows_gpu_or_cpu
-        } else {
-            // ==================== CPU fallback (original) ====================
-            let _s = prof.scope("chunk_cluster_em_bic");
-            (chunk_start..end)
-                .into_par_iter()
-                .map(|j| {
-                    let id = ids[j];
-                    let mut pts = Vec::with_capacity(s_samples);
-                    let mut raw = Vec::with_capacity(s_samples);
-
-                    for si in 0..s_samples {
-                        let p = pos_index[si][j];
-                        let red = samples[si].x_red[p] as f64;
-                        let grn = samples[si].y_grn[p] as f64;
-                        let lnr = (red + 1.0).ln();
-                        let lng = (grn + 1.0).ln();
-                        pts.push(to_features_from_logs(
-                            &cfg.feature_space, lnr, lng,
-                        ));
-                        let rsum = (samples[si].x_red[p] as u32)
-                            + (samples[si].y_grn[p] as u32);
-                        raw.push(rsum);
-                    }
-
-                    let mut model = choose_k(
-                        &pts,
-                        cfg.k_max,
-                        cfg.max_iters,
-                        cfg.tol,
-                        cfg.seed,
-                        cfg.restarts,
-                    );
-
-                    // lightweight heuristics (unchanged)
-                    const GAP3_TO_2: f64 = 0.035;
-                    const GAP2_TO_1: f64 = 0.020;
-                    const MIN_W: f64 = 0.03;
-                    let sorted_thetas =
-                        |means: &[(f64, f64)], w_theta: f64| -> Vec<f64> {
-                            let wth = w_theta.max(1e-9);
-                            let mut t: Vec<f64> =
-                                means.iter().map(|m| m.0 / wth).collect();
-                            t.sort_by(|a, b| a.partial_cmp(b).unwrap());
-                            t
-                        };
-                    {
-                        let wth = cfg.feature_space.w_theta;
-                        if model.k > 1 && model.weights.iter().any(|&w| w < MIN_W) {
-                            model = if model.k == 3 {
-                                fit_diag_restarts(
-                                    &pts,
-                                    2,
-                                    cfg.max_iters,
-                                    cfg.tol,
-                                    cfg.seed,
-                                    cfg.restarts,
-                                )
-                            } else {
-                                fit_k1(&pts)
-                            };
-                        }
-                        let t = sorted_thetas(&model.means, wth);
-                        if model.k == 3 {
-                            let min_gap = (t[1] - t[0])
-                                .abs()
-                                .min((t[2] - t[1]).abs());
-                            if min_gap < GAP3_TO_2 {
-                                let m2 = fit_diag_restarts(
-                                    &pts,
-                                    2,
-                                    cfg.max_iters,
-                                    cfg.tol,
-                                    cfg.seed,
-                                    cfg.restarts,
-                                );
-                                let t2 = sorted_thetas(&m2.means, wth);
-                                let gap = (t2[1] - t2[0]).abs();
-                                model = if gap < GAP2_TO_1 {
-                                    fit_k1(&pts)
-                                } else {
-                                    m2
-                                };
-                            }
-                        } else if model.k == 2 {
-                            let gap = (t[1] - t[0]).abs();
-                            if gap < GAP2_TO_1 {
-                                model = fit_k1(&pts);
-                            }
-                        }
-                    }
-
-                    let (mut labs, mut post) = (Vec::new(), Vec::new());
-                    predict(&model, &pts, &mut labs, &mut post);
-
-                    Row {
-                        idx: j,
-                        id,
-                        raw,
-                        labs,
-                        post,
-                        means: model.means.clone(),
-                        vars: model.vars.clone(),
-                    }
-                })
-                .collect()
+            }
         };
 
         // ================= τ (auto once) =================

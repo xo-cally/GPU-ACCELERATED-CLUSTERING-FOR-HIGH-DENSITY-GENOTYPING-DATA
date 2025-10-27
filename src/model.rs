@@ -30,10 +30,13 @@ pub fn gpu_bic_batched(s: usize, b: usize, k: usize, ll: &[f32]) -> Option<Vec<f
 }
 
 // ---- GPU debug/knobs ----
+#[cfg(feature = "gpu")]
 #[inline]
 fn gpu_debug() -> bool {
     std::env::var("GPU_DEBUG").as_deref() == Ok("1")
 }
+
+#[cfg(feature = "gpu")]
 #[inline]
 fn gpu_min_n() -> usize {
     std::env::var("GPU_MIN_N")
@@ -41,6 +44,8 @@ fn gpu_min_n() -> usize {
         .and_then(|s| s.parse().ok())
         .unwrap_or(4096)
 }
+
+#[cfg(feature = "gpu")]
 #[inline]
 fn gpu_force() -> bool {
     std::env::var("GPU_FORCE").as_deref() == Ok("1")

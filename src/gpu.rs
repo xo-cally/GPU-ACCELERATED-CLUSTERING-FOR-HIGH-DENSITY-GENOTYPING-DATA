@@ -366,7 +366,7 @@ pub fn em_one_iter_k_batched(
     let k_i: i32 = k.try_into().ok()?;
 
     // Chunk to cap device memory
-    let max_chunk_size = 100usize;
+    let max_chunk_size = 1000usize;
     let mut snp0 = 0usize;
     while snp0 < b {
         let bc = std::cmp::min(max_chunk_size, b - snp0);
