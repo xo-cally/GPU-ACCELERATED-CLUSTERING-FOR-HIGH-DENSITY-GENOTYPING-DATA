@@ -23,7 +23,7 @@ At a high level, the pipeline:
 
 3. **Transforms intensities to Theta–R space**  
    Converts raw fluorescence `(R, G)` to  
-   - `θ = 2·atan(G/R)/π` and  
+   - `θ = 2·arctan(G/R)/π` and  
    - `r = ln(R + G + 1)`  
    then applies configurable weights `(W_THETA, W_R)`.
 
@@ -72,6 +72,8 @@ git clone git@github.com:xo-cally/GPU-ACCELERATED-CLUSTERING-FOR-HIGH-DENSITY-GE
 cd ~/genotyping_pipeline
 ```
 
+---
+
 ## Repository layout
 ```text
 src/
@@ -94,6 +96,8 @@ slurm/
 logs/    - (created at runtime) SLURM stdout/stderr
 results/ - (created at runtime) per-run outputs, timing summaries, plots, feedback
 ```
+
+---
 
 ## Building
 ### CPU-only build
@@ -227,6 +231,8 @@ sbatch \
   slurm/run_genotyping_fixed.sbatch
 ```
 
+---
+
 ## Logs and outputs
 SLURM stdout/stderr go to:
 ```text 
@@ -245,10 +251,14 @@ This directory typically contains:
 - Plots for the first N SNPs 
 - Additional diagnostic files depending on run options
 
+---
+
 ## Reproducibility notes
 - Fixed seeds & restarts: Runs are controlled via SEED and RESTARTS, which govern GMM initialisation and EM restarts. Keeping these fixed allows fair CPU vs GPU comparisons.
 - Feedback loop is persistent: feedback.csv and bad_snps.txt are updated across runs. If you want a “fresh” experiment, either point FEEDBACK_PATH/BAD_SNPS_PATH to new files or delete the old ones.
 - Here, `p_min` / `PMIN` (τ) is the minimum posterior probability required to make a genotype call.
+
+---
 
 ## Acknowledgements
 - Sydney Brenner Institute for synthetic, anonymised SNP array data.
