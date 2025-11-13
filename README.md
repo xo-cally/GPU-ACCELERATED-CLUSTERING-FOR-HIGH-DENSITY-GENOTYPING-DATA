@@ -19,11 +19,11 @@ At a high level, the pipeline:
    Walks a root directory, finds matching Red/Green IDATs for each sample, and builds a per-sample list of probe IDs and intensities.
 
 2. **Intersects SNP IDs across the cohort**  
-   Computes the intersection of Illumina IDs so that SNP index `j` refers to the same SNP for every sample (deterministic alignment).
+   Computes the intersection of Illumina IDs so that SNP index `j` refers to the same probe for every sample (deterministic alignment).
 
 3. **Transforms intensities to Theta–R space**  
    Converts raw fluorescence `(R, G)` to  
-   - `θ = 2·arctan(G/R)/π` and  
+   - `θ = 2·atan(G/R)/π` and  
    - `r = ln(R + G + 1)`  
    then applies configurable weights `(W_THETA, W_R)`.
 
@@ -72,8 +72,6 @@ git clone git@github.com:xo-cally/GPU-ACCELERATED-CLUSTERING-FOR-HIGH-DENSITY-GE
 cd ~/genotyping_pipeline
 ```
 
----
-
 ## Repository layout
 ```text
 src/
@@ -97,8 +95,6 @@ logs/    - (created at runtime) SLURM stdout/stderr
 results/ - (created at runtime) per-run outputs, timing summaries, plots, feedback
 ```
 
----
-
 ## Building
 ### CPU-only build
 ```bash
@@ -121,31 +117,85 @@ cargo build --release --features gpu
 
 ---
 
-## Basic CLI usage
-```bash
-./target/release/genotyping_pipeline \
-  --root /dataC/idat \
-  --out-dir results/test_run \
-  --feat thetar \
-  --thetar 1.0 0.45 \
-  --r-min 500 \
-  --p-min 0.85 \
-  --k-max 3 \
-  --max-iters 200 \
-  --tol 1e-6 \
-  --seed 42 \
-  --restarts 3 \
-  --max-maha 3.0 \
-  --plot-first-snps 50 \
-  --first 100 \
-  --max-snps 50000 \
-  --feedback-in feedback.csv \
-  --feedback-out feedback.csv \
-  --bad-snps-in bad_snps.txt \
-  --bad-snps-out bad_snps.txt \
-  --nocall-bad-thresh 0.05 \
-  --drop-bad-snps
-```
+## CLI options
+
+Below is a summary of the main command-line flags. Many of the example values shown (e.g. `r_min = 500`, `p_min = 0.85`) are the ones we used in our experiments; adjust as needed for your dataset.
+
+### Core I/O
+
+| Flag              | Description                                                                                 |
+|-------------------|---------------------------------------------------------------------------------------------|
+| `--root PATH`     | **Required.** Root directory containing the Red/Green IDAT files (e.g. `/dataC/idat`).     |
+| `--out-dir PATH`  | **Required.** Output directory for this run (CSV outputs, timings, plots, feedback, etc.). |
+
+### Feature space (Theta–R)
+
+| Flag                       | Description                                                                                           |
+|----------------------------|-------------------------------------------------------------------------------------------------------|
+| `--feat NAME`              | Feature space to use. Currently `thetar` is supported (Theta–R transform).                           |
+| `--thetar W_THETA W_R`     | Weights applied to θ and r respectively (e.g. `1.0 0.45`) before clustering.                         |
+
+### Gating and quality thresholds
+
+| Flag                      | Description                                                                                                                        |
+|---------------------------|------------------------------------------------------------------------------------------------------------------------------------|
+| `--r-min FLOAT`           | Intensity floor `r_min`. SNPs below this are treated as low-intensity and more likely to NoCall (e.g. `500`).                     |
+| `--p-min FLOAT\|auto`     | Minimum posterior probability τ required to make a genotype call (e.g. `0.85`). Use `auto` to learn τ from FDR control.           |
+| `--alpha FLOAT`           | FDR level for automatic `p_min` selection (only used when `--p-min auto`, e.g. `0.005`).                                          |
+| `--max-maha FLOAT`        | Maximum allowed Mahalanobis distance from the assigned cluster centre before forcing a NoCall (e.g. `3.0`).                        |
+
+### GMM / EM configuration
+
+| Flag                 | Description                                                                                           |
+|----------------------|-------------------------------------------------------------------------------------------------------|
+| `--k-max INT`        | Maximum number of mixture components (clusters) per SNP. The model chooses `K ∈ {1, ..., k_max}`.     |
+| `--max-iters INT`    | Maximum EM iterations per restart per SNP (e.g. `200`).                                              |
+| `--tol FLOAT`        | Convergence tolerance on the EM log-likelihood (e.g. `1e-6`).                                        |
+| `--seed INT`         | RNG seed used for initialisation and reproducibility (e.g. `42`).                                    |
+| `--restarts INT`     | Number of EM restarts per SNP; best (highest likelihood) solution is kept (e.g. `3`).                |
+
+### Cohort / SNP limiting
+
+| Flag                    | Description                                                                                                           |
+|-------------------------|-----------------------------------------------------------------------------------------------------------------------|
+| `--first INT`           | Limit to the first `INT` samples discovered under `--root`. `0` means all samples.                                   |
+| `--max-snps INT`        | If non-zero, cap the total number of SNPs processed (after intersection) to the first `INT` SNPs.                    |
+| `--sample-snps INT`     | If non-zero, randomly sample `INT` SNPs from the cohort instead of taking the first `INT` SNPs (mutually exclusive with `--max-snps`). |
+
+### Plotting
+
+| Flag                      | Description                                                                                                  |
+|---------------------------|--------------------------------------------------------------------------------------------------------------|
+| `--plot-first-snps INT`   | Number of SNPs to plot for diagnostic scatter plots (e.g. first `N` SNPs or a random subset, depending on build). |
+
+### Feedback / bad-SNP handling
+
+| Flag                        | Description                                                                                                               |
+|-----------------------------|---------------------------------------------------------------------------------------------------------------------------|
+| `--feedback-in PATH`        | Path to an existing `feedback.csv` file to read per-SNP statistics from (if present).                                    |
+| `--feedback-out PATH`       | Path to write updated `feedback.csv` after the run.                                                                      |
+| `--bad-snps-in PATH`        | Path to an existing `bad_snps.txt` list to read SNPs to drop or downweight.                                              |
+| `--bad-snps-out PATH`       | Path to write the updated `bad_snps.txt` list after the run.                                                             |
+| `--nocall-bad-thresh FLOAT` | Threshold on the NoCall rate above which a SNP is treated as “bad” and added to the bad-SNP list (e.g. `0.05`).          |
+| `--drop-bad-snps`           | If present, drops SNPs flagged as bad from the cohort instead of keeping them with low confidence.                       |
+
+### GPU vs CPU selection
+
+Whether the CPU or GPU path is used is controlled by:
+
+- **Build-time:**  
+  - CPU-only: `cargo build --release`  
+  - GPU-enabled: `cargo build --release --features gpu`
+- **Runtime (cluster):**  
+  - Environment variable `USE_GPU=1` (GPU path on) or `USE_GPU=0` (CPU path only); see the SLURM examples above.
+
+Additional GPU-related environment variables (set in the SLURM script) include:
+
+- `GPU_DEBUG` – extra logging and internal checks when set to `1`.
+- `GPU_MIN_N` – minimum per-batch size required before offloading to GPU; below this, the CPU path may be used instead.
+- `GPU_FORCE` – when set to `1`, forces GPU use even for smaller workloads.
+- `GPU_ARCH` – NVRTC JIT target (e.g. `compute_89` for NVIDIA L4).
+- `CUDA_PATH` – CUDA toolkit location (e.g. `/usr/local/cuda-13.0`).
 
 ---
 
@@ -177,8 +227,6 @@ sbatch \
   slurm/run_genotyping_fixed.sbatch
 ```
 
----
-
 ## Logs and outputs
 SLURM stdout/stderr go to:
 ```text 
@@ -194,17 +242,13 @@ results/YYYYMMDD_HHMM_fixedR<R_MIN>tau<PMIN><gpu|cpu>_noNorm/
 This directory typically contains:
 - Genotype call CSVs
 - timings.csv and timings_summary.csv
-- Plots for a subset of SNPs (first N or random N), as configured
+- Plots for the first N SNPs 
 - Additional diagnostic files depending on run options
-
----
 
 ## Reproducibility notes
 - Fixed seeds & restarts: Runs are controlled via SEED and RESTARTS, which govern GMM initialisation and EM restarts. Keeping these fixed allows fair CPU vs GPU comparisons.
 - Feedback loop is persistent: feedback.csv and bad_snps.txt are updated across runs. If you want a “fresh” experiment, either point FEEDBACK_PATH/BAD_SNPS_PATH to new files or delete the old ones.
 - Here, `p_min` / `PMIN` (τ) is the minimum posterior probability required to make a genotype call.
-
----
 
 ## Acknowledgements
 - Sydney Brenner Institute for synthetic, anonymised SNP array data.
