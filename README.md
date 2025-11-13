@@ -247,7 +247,7 @@ results/YYYYMMDD_HHMM_fixedR<R_MIN>tau<PMIN><gpu|cpu>_noNorm/
 
 This directory typically contains:
 - Genotype call CSVs
-- timings.csv and timings_summary.csv
+- Detailed and summary timing CSVs capturing per-stage and aggregated runtimes
 - Plots for the first N SNPs 
 - Additional diagnostic files depending on run options
 
