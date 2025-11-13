@@ -38,7 +38,7 @@ At a high level, the pipeline:
    - GPU: Batched EM/BIC kernels via `cudarc`, with thresholds to decide when GPU is worthwhile.
 
 7. **Writes outputs and timing summaries**  
-   Outputs genotype calls, timing CSVs, plots for early SNPs, and feedback files to a timestamped results directory.
+   Outputs genotype calls, timing CSVs, plots for the first N SNPs, and feedback files to a timestamped results directory.
 
 ---
 
@@ -90,12 +90,10 @@ src/
 
   gpu.rs         - (feature = "gpu") CUDA kernels + cudarc wrappers for batched EM and BIC
 
-slurm/
-  run_genotyping_fixed.sbatch  - SLURM wrapper used for CPU/GPU runs on Wits Core Cluster
-
 logs/    - (created at runtime) SLURM stdout/stderr
-results/ - (created at runtime) per-run outputs, timing summaries, plots, feedback
+results/ - (created at runtime) per-run outputs, timing summaries, plots, and feedback
 ```
+SLURM scripts are cluster-specific and not included; see the “Running on SLURM” section for example commands.
 
 ---
 
@@ -191,7 +189,7 @@ Whether the CPU or GPU path is used is controlled by:
   - CPU-only: `cargo build --release`  
   - GPU-enabled: `cargo build --release --features gpu`
 - **Runtime (cluster):**  
-  - Environment variable `USE_GPU=1` (GPU path on) or `USE_GPU=0` (CPU path only); see the SLURM examples above.
+  - Environment variable `USE_GPU=1` (GPU path on) or `USE_GPU=0` (CPU path only); see the SLURM examples below.
 
 Additional GPU-related environment variables (set in the SLURM script) include:
 
@@ -203,8 +201,10 @@ Additional GPU-related environment variables (set in the SLURM script) include:
 
 ---
 
-## Running on SLURM (Wits Core Cluster)
+## Running on SLURM (example)
 For large cohorts, we submit jobs via SLURM.
+
+NOTE: The repository does not include SLURM scripts; the examples below show how you might submit jobs on a SLURM-based cluster.
 
 ### Example: GPU timing run (2290 samples):
 ```bash
@@ -216,7 +216,7 @@ sbatch \
   --mem=128G \
   --gres=gpu:1 \
   --time=72:00:00 \
-  slurm/run_genotyping_fixed.sbatch
+  /path/to/your_sbatch_wrapper.sbatch
 ```
 
 ### Example: CPU baseline (no GPU):
@@ -228,8 +228,9 @@ sbatch \
   --cpus-per-task=24 \
   --mem=128G \
   --time=72:00:00 \
-  slurm/run_genotyping_fixed.sbatch
+  /path/to/your_sbatch_wrapper.sbatch
 ```
+NOTE: Replace `/path/to/your_sbatch_wrapper.sbatch` with your own SLURM script.
 
 ---
 
